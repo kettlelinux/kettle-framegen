@@ -71,10 +71,13 @@ struct config {
     bool fifo;             // force FIFO presentation (read at swapchain creation)
     bool preserve_images;  // no extra swapchain images (read at swapchain creation)
     bool stats;            // log GPU time every 2 s
+    char dump[512];        // save the next generated frames here ("dump = <dir>", see dump())
+    unsigned dump_serial;  // counts file loads that asked for a dump
 };
 
 static pthread_mutex_t cfg_lock = PTHREAD_MUTEX_INITIALIZER;
 static struct config cfg;
+static unsigned cfg_dump_serial;
 static bool cfg_loaded;
 static char cfg_path[1024];
 static struct timespec cfg_mtime;
@@ -99,6 +102,8 @@ static void config_set(struct config *c, const char *k, const char *v)
         c->preserve_images = parse_bool(v);
     else if (!strcmp(k, "stats"))
         c->stats = parse_bool(v);
+    else if (!strcmp(k, "dump"))
+        snprintf(c->dump, sizeof(c->dump), "%s", v);
 }
 
 static char *trim(char *s)
@@ -145,6 +150,9 @@ static void config_load(void)
         c.flow_scale = 0.1f;
     if (c.flow_scale > 1.0f)
         c.flow_scale = 1.0f;
+    if (c.dump[0])
+        cfg_dump_serial++;
+    c.dump_serial = cfg_dump_serial;
     cfg = c;
 }
 
@@ -296,6 +304,7 @@ struct swapchain {
     // Generated frames per present that found a spare image; after a timeout, one more is
     // tried (without waiting) every 10 s from probe_at
     uint32_t gen_limit;
+    unsigned dump_serial;  // last config dump request served
     double probe_at;
     // Created on the first present (they need the present queue's family): the frame ring,
     // kept for the swapchain's life since presents wait on its semaphores, and the flow
@@ -949,13 +958,14 @@ static void record(struct swapchain *sc, VkCommandBuffer cmd, int slot, uint32_t
     d->EndCommandBuffer(cmd);
 }
 
-// Debugging: with KETTLE_FG_DUMP=<dir>, the previous frame, the generated ones and the current
-// frame of present number KETTLE_FG_DUMP_FRAME (default 300) go to <dir>/kettle-fg-<n>-<i>.ppm.
-static void dump(struct swapchain *sc, struct frame *f, uint32_t ngen)
+// Debugging: the previous frame, the generated ones and the current frame go to
+// <dir>/kettle-fg-<present>-<i>.ppm. Taken at present KETTLE_FG_DUMP_FRAME (default 300) with
+// KETTLE_FG_DUMP=<dir>, or at the next present after the game's settings file gains (or is
+// rewritten with) a `dump = <dir>` line: no restart needed.
+static void dump(struct swapchain *sc, struct frame *f, uint32_t ngen, const char *dir)
 {
     struct dev *d = sc->dev;
     VkDevice dev = d->handle;
-    const char *dir = getenv("KETTLE_FG_DUMP");
     uint32_t w = sc->extent.width, h = sc->extent.height, n = ngen + 2;
     VkImage src[MAX_GEN + 2];
     src[0] = sc->hist[sc->cur ^ 1].image;
@@ -1186,7 +1196,11 @@ static VKAPI_ATTR VkResult VKAPI_CALL QueuePresentKHR(VkQueue queue, const VkPre
     if (ngen && getenv("KETTLE_FG_DUMP")) {
         const char *at = getenv("KETTLE_FG_DUMP_FRAME");
         if (sc->count == (uint64_t)(at ? atoll(at) : 300))
-            dump(sc, f, ngen);
+            dump(sc, f, ngen, getenv("KETTLE_FG_DUMP"));
+    }
+    if (ngen && c.dump[0] && c.dump_serial != sc->dump_serial) {
+        sc->dump_serial = c.dump_serial;
+        dump(sc, f, ngen, c.dump);
     }
 
     for (uint32_t k = 0; k < ngen; k++) {
@@ -1290,13 +1304,14 @@ static VKAPI_ATTR VkResult VKAPI_CALL CreateSwapchainKHR(VkDevice device, const 
         sc->extent = ci->imageExtent;
         sc->hist_format = hist;
         sc->gen_limit = MAX_GEN;
+        sc->dump_serial = c.dump_serial;  // only requests made after it exists
         sc->bgr = bgr;
         pthread_mutex_lock(&lock);
         sc->next = swapchains;
         swapchains = sc;
         pthread_mutex_unlock(&lock);
-        say("swapchain %ux%u, %u images (%u extra), present mode %d", ci->imageExtent.width,
-            ci->imageExtent.height, sc->nimages, extra, ci2.presentMode);
+        say("swapchain %ux%u format %d, %u images (%u extra), present mode %d", ci->imageExtent.width,
+            ci->imageExtent.height, ci->imageFormat, sc->nimages, extra, ci2.presentMode);
     } else if (sc) {
         free(sc->images);
         free(sc->present_sems);
