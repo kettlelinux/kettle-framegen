@@ -9,6 +9,8 @@
 // previous frame's final vector. The best one is refined by a small full search (wider at the
 // coarsest level, where nothing comes from below), then by half-pixel steps at level 0.
 // A small penalty for straying from the predicted vector keeps flat areas from picking noise.
+// Blocks a candidate already matches almost exactly (most of a typical game frame: static
+// scenery, HUD, motion that continues from the previous frame) skip both refinements.
 #version 450
 layout(local_size_x = 8, local_size_y = 8) in;
 
@@ -29,6 +31,7 @@ layout(push_constant) uniform PC {
 
 const int B = 8;
 const float NONE = 1e9;
+const float GOOD = 16.0 * 0.01;  // cost of a near-exact match: 0.01 mean luma difference
 
 vec2 base;    // block origin, level pixels
 vec2 pred;    // vector the penalty is measured from
@@ -92,6 +95,11 @@ void main()
         try_vector(coarse_at(c - ivec2(1, 0)), best, best_cost);
         try_vector(coarse_at(c + ivec2(0, 1)), best, best_cost);
         try_vector(coarse_at(c - ivec2(0, 1)), best, best_cost);
+    }
+
+    if (pc.coarsest == 0 && best_cost < GOOD) {
+        imageStore(dst, b, vec4(best, best_cost / 16.0, 0.0));
+        return;
     }
 
     int r = pc.coarsest != 0 ? 3 : 1;
