@@ -1,0 +1,113 @@
+// SPDX-License-Identifier: BSD-3-Clause
+// Block motion for one pyramid level, coarsest first. One invocation per 8x8 block.
+//
+// Vectors are bilateral: a vector v for a block at p says the content there moves from
+// p - v/2 in the previous frame to p + v/2 in the current one. The block is where the
+// in-between frame's pixels are, so interpolation needs no forward warping and leaves no holes.
+//
+// Candidates: zero, the level below's vector for this block and its four neighbours, and the
+// previous frame's final vector. The best one is refined by a small full search (wider at the
+// coarsest level, where nothing comes from below), then by half-pixel steps at level 0.
+// A small penalty for straying from the predicted vector keeps flat areas from picking noise.
+#version 450
+layout(local_size_x = 8, local_size_y = 8) in;
+
+layout(binding = 0) uniform sampler2D prev_pyr;
+layout(binding = 1) uniform sampler2D cur_pyr;
+layout(binding = 2) uniform sampler2D coarse;    // vectors of the level below (unused at the coarsest)
+layout(binding = 3) uniform sampler2D temporal;  // previous frame's final vectors, level-0 units
+layout(binding = 4, rgba16f) uniform writeonly image2D dst;
+
+layout(push_constant) uniform PC {
+    vec2 luma_size;  // this level, pixels
+    vec2 mv0_size;   // level-0 vector field, blocks
+    int level;
+    int coarsest;
+    int use_temporal;
+    float lambda;
+} pc;
+
+const int B = 8;
+const float NONE = 1e9;
+
+vec2 base;    // block origin, level pixels
+vec2 pred;    // vector the penalty is measured from
+float lod;
+
+// Sum of absolute luma differences over a 4x4 grid in the block. Each tap sits on a texel
+// corner, so bilinear filtering averages 2x2 texels and the grid still covers every pixel.
+float cost(vec2 v)
+{
+    vec2 h = 0.5 * v;
+    float s = 0.0;
+    for (int j = 0; j < 4; j++)
+        for (int i = 0; i < 4; i++) {
+            vec2 q = base + vec2(2 * i + 1, 2 * j + 1);
+            s += abs(textureLod(prev_pyr, (q - h) / pc.luma_size, lod).r -
+                     textureLod(cur_pyr, (q + h) / pc.luma_size, lod).r);
+        }
+    vec2 d = abs(v - pred);
+    return s + pc.lambda * (d.x + d.y);
+}
+
+void try_vector(vec2 v, inout vec2 best, inout float best_cost)
+{
+    float c = cost(v);
+    if (c < best_cost) {
+        best_cost = c;
+        best = v;
+    }
+}
+
+vec2 coarse_at(ivec2 b)
+{
+    return 2.0 * texelFetch(coarse, clamp(b, ivec2(0), textureSize(coarse, 0) - 1), 0).xy;
+}
+
+void main()
+{
+    ivec2 b = ivec2(gl_GlobalInvocationID.xy);
+    if (any(greaterThanEqual(b, imageSize(dst))))
+        return;
+    base = vec2(b * B);
+    lod = float(pc.level);
+    float scale = exp2(-lod);  // level-0 pixels to this level's
+
+    vec2 temporal_v = vec2(0.0);
+    if (pc.use_temporal != 0) {
+        vec2 center0 = (base + 0.5 * B) / scale;
+        temporal_v = textureLod(temporal, center0 / (B * pc.mv0_size), 0.0).xy * scale;
+    }
+    pred = pc.coarsest != 0 ? temporal_v : coarse_at(b / 2);
+
+    vec2 best = vec2(0.0);
+    float best_cost = NONE;
+    try_vector(vec2(0.0), best, best_cost);
+    try_vector(pred, best, best_cost);
+    if (pc.use_temporal != 0)
+        try_vector(temporal_v, best, best_cost);
+    if (pc.coarsest == 0) {
+        ivec2 c = b / 2;
+        try_vector(coarse_at(c + ivec2(1, 0)), best, best_cost);
+        try_vector(coarse_at(c - ivec2(1, 0)), best, best_cost);
+        try_vector(coarse_at(c + ivec2(0, 1)), best, best_cost);
+        try_vector(coarse_at(c - ivec2(0, 1)), best, best_cost);
+    }
+
+    int r = pc.coarsest != 0 ? 3 : 1;
+    vec2 center = best;
+    for (int y = -r; y <= r; y++)
+        for (int x = -r; x <= r; x++)
+            if (x != 0 || y != 0)
+                try_vector(center + vec2(x, y), best, best_cost);
+
+    if (pc.level == 0) {
+        center = best;
+        for (int y = -1; y <= 1; y++)
+            for (int x = -1; x <= 1; x++)
+                if (x != 0 || y != 0)
+                    try_vector(center + 0.5 * vec2(x, y), best, best_cost);
+    }
+
+    imageStore(dst, b, vec4(best, best_cost / 16.0, 0.0));
+}

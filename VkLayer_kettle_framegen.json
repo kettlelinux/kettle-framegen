@@ -1,0 +1,17 @@
+{
+  "file_format_version": "1.1.0",
+  "layer": {
+    "name": "VK_LAYER_KETTLE_framegen",
+    "description": "Kettle Linux: frame generation",
+    "implementation_version": "1",
+    "library_path": "/usr/lib/libVkLayer_kettle_framegen.so",
+    "type": "GLOBAL",
+    "api_version": "1.4.309",
+    "enable_environment": {
+      "KETTLE_FG": "1"
+    },
+    "disable_environment": {
+      "DISABLE_KETTLE_FG": "1"
+    }
+  }
+}
