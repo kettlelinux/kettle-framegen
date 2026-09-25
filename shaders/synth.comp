@@ -5,11 +5,16 @@
 // here, the four nearest block vectors, or zero, whichever makes the two frames agree best (with
 // a small bias to the interpolated one). That keeps motion edges sharp where interpolated
 // vectors would mix two motions, and static overlays (HUDs) still where their block moves.
+// Agreement is measured over the pixel and its left and right neighbours, so a single pixel
+// can't pick a vector its neighbourhood disagrees with (lone specks).
 // Where even the best vector leaves the frames disagreeing, the pixel is occluded in one of
 // them or the motion is wrong, and blending would show both images; there it comes from the
-// frame nearer in time instead.
+// frame nearer in time instead. Where a vector leads outside one frame (content coming into
+// view at the screen edge), only the other frame is used.
+// On a scene cut (filter.comp counts blocks no vector matched) the frame is the nearer real one.
 // Colors stay in the swapchain's raw channel order and encoding, packed into its 32-bit layout
-// (8-bit RGBA or 10:10:10:2): the result is copied back as is.
+// (8-bit RGBA or 10:10:10:2): the result is copied back as is. Colour maths is mediump (fp16
+// where the GPU has it); coordinates need full precision at 1080p.
 #version 450
 layout(local_size_x = 8, local_size_y = 8) in;
 
@@ -17,6 +22,9 @@ layout(binding = 0) uniform sampler2D prev_img;
 layout(binding = 1) uniform sampler2D cur_img;
 layout(binding = 2) uniform sampler2D mv;
 layout(binding = 3, r32ui) uniform writeonly uimage2D dst;
+layout(binding = 4) readonly buffer Cut {
+    uint bad_blocks;
+} cut;
 
 layout(push_constant) uniform PC {
     vec2 size;      // frame, pixels
@@ -26,7 +34,7 @@ layout(push_constant) uniform PC {
     int flags;      // 1: follow motion (else plain blend), 2: 10:10:10:2 pixels
 } pc;
 
-uint pack(vec4 c)
+uint pack(mediump vec4 c)
 {
     c = clamp(c, 0.0, 1.0);
     if ((pc.flags & 2) != 0) {
@@ -37,15 +45,45 @@ uint pack(vec4 c)
     return u.r | (u.g << 8) | (u.b << 16) | (u.a << 24);
 }
 
-vec4 a, b;  // previous and current frame along the chosen vector
-float best = 1e9;
-
-void try_vector(vec2 q, vec2 v, float bias)
+bool inside(vec2 p)
 {
-    vec4 pa = textureLod(prev_img, (q - pc.t * v) / pc.size, 0.0);
-    vec4 pb = textureLod(cur_img, (q + (1.0 - pc.t) * v) / pc.size, 0.0);
-    vec3 d = abs(pa.rgb - pb.rgb);
-    float c = d.r + d.g + d.b + bias;
+    return all(greaterThanEqual(p, vec2(0.0))) && all(lessThanEqual(p, pc.size));
+}
+
+mediump float diff(mediump vec4 x, mediump vec4 y)
+{
+    mediump vec3 d = abs(x.rgb - y.rgb);
+    return d.r + d.g + d.b;
+}
+
+mediump vec4 a, b;  // previous and current frame along the chosen vector
+mediump float best = 1e4;
+
+void try_vector(vec2 q, vec2 v, mediump float bias)
+{
+    vec2 qa = q - pc.t * v, qb = q + (1.0 - pc.t) * v;
+    bool ina = inside(qa), inb = inside(qb);
+    if (!ina && !inb)
+        return;
+    vec2 rcp = 1.0 / pc.size;
+    mediump vec4 pa = textureLod(prev_img, qa * rcp, 0.0);
+    mediump vec4 pb = textureLod(cur_img, qb * rcp, 0.0);
+    mediump float c;
+    if (ina && inb) {
+        vec2 dx = vec2(1.0, 0.0);
+        c = diff(pa, pb) +
+            0.5 * diff(textureLod(prev_img, (qa - dx) * rcp, 0.0), textureLod(cur_img, (qb - dx) * rcp, 0.0)) +
+            0.5 * diff(textureLod(prev_img, (qa + dx) * rcp, 0.0), textureLod(cur_img, (qb + dx) * rcp, 0.0));
+    } else {
+        // one side has left the frame: nothing to check against, so only take this
+        // vector when nothing that can be checked fits
+        if (ina)
+            pb = pa;
+        else
+            pa = pb;
+        c = 0.3;
+    }
+    c += bias;
     if (c < best) {
         best = c;
         a = pa;
@@ -60,21 +98,30 @@ void main()
         return;
     vec2 q = vec2(p) + 0.5;
     bool flow = (pc.flags & 1) != 0;
+    ivec2 grid = textureSize(mv, 0);
+    // measured: a cut leaves 40-50% of blocks unmatched, even fast motion under 1%
+    bool scene_cut = flow && cut.bad_blocks * 10u > uint(grid.x * grid.y) * 3u;
+    if (scene_cut) {
+        // unrelated frames: interpolating would only blend them
+        vec2 uv = q / pc.size;
+        imageStore(dst, p, uvec4(pack(pc.t < 0.5 ? textureLod(prev_img, uv, 0.0) : textureLod(cur_img, uv, 0.0))));
+        return;
+    }
     if (flow) {
-        vec2 f = q * pc.mv_uv * vec2(textureSize(mv, 0)) - 0.5;  // position in the block grid
+        vec2 f = q * pc.mv_uv * vec2(grid) - 0.5;  // position in the block grid
         ivec2 i = ivec2(floor(f));
-        ivec2 last = textureSize(mv, 0) - 1;
+        ivec2 last = grid - 1;
         try_vector(q, textureLod(mv, q * pc.mv_uv, 0.0).xy * pc.mv_to_px, 0.0);
-        try_vector(q, texelFetch(mv, clamp(i, ivec2(0), last), 0).xy * pc.mv_to_px, 0.02);
-        try_vector(q, texelFetch(mv, clamp(i + ivec2(1, 0), ivec2(0), last), 0).xy * pc.mv_to_px, 0.02);
-        try_vector(q, texelFetch(mv, clamp(i + ivec2(0, 1), ivec2(0), last), 0).xy * pc.mv_to_px, 0.02);
-        try_vector(q, texelFetch(mv, clamp(i + ivec2(1, 1), ivec2(0), last), 0).xy * pc.mv_to_px, 0.02);
-        try_vector(q, vec2(0.0), 0.04);
+        try_vector(q, texelFetch(mv, clamp(i, ivec2(0), last), 0).xy * pc.mv_to_px, 0.04);
+        try_vector(q, texelFetch(mv, clamp(i + ivec2(1, 0), ivec2(0), last), 0).xy * pc.mv_to_px, 0.04);
+        try_vector(q, texelFetch(mv, clamp(i + ivec2(0, 1), ivec2(0), last), 0).xy * pc.mv_to_px, 0.04);
+        try_vector(q, texelFetch(mv, clamp(i + ivec2(1, 1), ivec2(0), last), 0).xy * pc.mv_to_px, 0.04);
+        try_vector(q, vec2(0.0), 0.08);
     } else {
         try_vector(q, vec2(0.0), 0.0);
     }
-    vec3 d = abs(a.rgb - b.rgb);
-    float w = flow ? smoothstep(0.08, 0.25, max(d.r, max(d.g, d.b))) : 0.0;
-    vec4 nearer = pc.t < 0.5 ? a : b;
+    mediump vec3 d = abs(a.rgb - b.rgb);
+    mediump float w = flow ? smoothstep(0.08, 0.25, max(d.r, max(d.g, d.b))) : 0.0;
+    mediump vec4 nearer = pc.t < 0.5 ? a : b;
     imageStore(dst, p, uvec4(pack(mix(mix(a, b, pc.t), nearer, w))));
 }

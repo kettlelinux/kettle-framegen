@@ -43,6 +43,8 @@
 #define MAX_LEVELS 7
 #define MAX_QUEUES 64
 #define BLOCK 8            // motion block size, pixels (motion.comp B)
+// GPU timestamps per present: start, then the end of each stage
+enum { TS_START, TS_PYRAMID, TS_MOTION, TS_SYNTH, TS_OUTPUT, NTS };
 #define ACQUIRE_TIMEOUT 100000000ull  // ns
 
 static void say(const char *fmt, ...)
@@ -229,13 +231,14 @@ struct inst {
     X(CmdPipelineBarrier) X(CmdCopyImage) X(CmdBindPipeline) X(CmdBindDescriptorSets)         \
     X(CmdPushConstants) X(CmdDispatch) X(CmdResetQueryPool) X(CmdWriteTimestamp)            \
     X(CreateBuffer) X(DestroyBuffer) X(GetBufferMemoryRequirements) X(BindBufferMemory)       \
-    X(MapMemory) X(CmdCopyImageToBuffer) X(FreeCommandBuffers)
+    X(MapMemory) X(CmdCopyImageToBuffer) X(FreeCommandBuffers) X(CmdFillBuffer) X(CmdCopyBuffer)
 
 enum { P_LUMA, P_DOWN, P_MOTION, P_FILTER, P_SYNTH, NPIPE };
 #define PUSH_SIZE 32
 
 #define S VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER
 #define W VK_DESCRIPTOR_TYPE_STORAGE_IMAGE
+#define B VK_DESCRIPTOR_TYPE_STORAGE_BUFFER  // always the swapchain's scene-cut counter
 static const struct pipe_spec {
     const uint32_t *code;
     size_t size;
@@ -245,11 +248,12 @@ static const struct pipe_spec {
     [P_LUMA] = { spv_luma0, sizeof(spv_luma0), 2, { S, W } },
     [P_DOWN] = { spv_down, sizeof(spv_down), 2, { S, W } },
     [P_MOTION] = { spv_motion, sizeof(spv_motion), 5, { S, S, S, S, W } },
-    [P_FILTER] = { spv_filter, sizeof(spv_filter), 2, { S, W } },
-    [P_SYNTH] = { spv_synth, sizeof(spv_synth), 4, { S, S, S, W } },
+    [P_FILTER] = { spv_filter, sizeof(spv_filter), 3, { S, W, B } },
+    [P_SYNTH] = { spv_synth, sizeof(spv_synth), 5, { S, S, S, W, B } },
 };
 #undef S
 #undef W
+#undef B
 
 struct dev {
     struct dev *next;
@@ -328,8 +332,10 @@ struct swapchain {
     bool have_prev;      // the other slot holds the previous frame and its pyramid
     bool have_mv;        // mvf of the other slot holds the previous frame's vectors
     bool fresh;          // images still in UNDEFINED layout
-    double gpu_ms, stat_t;
+    double gpu_ms[NTS], stat_t;  // per stage (gpu_ms[0]: total), summed over gpu_n presents
     uint32_t gpu_n, shown;
+    VkBuffer cut;                // blocks no vector matched (filter.comp -> synth.comp)
+    VkDeviceMemory cut_mem;
 };
 
 static pthread_mutex_t lock = PTHREAD_MUTEX_INITIALIZER;
@@ -505,6 +511,19 @@ static VkImageView view_create(struct dev *d, VkImage image, VkFormat fmt, uint3
     return v;
 }
 
+// Device-local memory if allowed, else any allowed type
+static uint32_t mem_type(struct dev *d, uint32_t allowed)
+{
+    uint32_t type = UINT32_MAX;
+    for (uint32_t i = 0; i < d->mem.memoryTypeCount && type == UINT32_MAX; i++)
+        if ((allowed & (1u << i)) && (d->mem.memoryTypes[i].propertyFlags & VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT))
+            type = i;
+    for (uint32_t i = 0; i < d->mem.memoryTypeCount && type == UINT32_MAX; i++)
+        if (allowed & (1u << i))
+            type = i;
+    return type;
+}
+
 static bool img_create(struct dev *d, struct img *im, VkFormat fmt, VkExtent2D size, uint32_t mips,
                        VkImageUsageFlags usage)
 {
@@ -525,14 +544,7 @@ static bool img_create(struct dev *d, struct img *im, VkFormat fmt, VkExtent2D s
         return false;
     VkMemoryRequirements req;
     d->GetImageMemoryRequirements(d->handle, im->image, &req);
-    uint32_t type = UINT32_MAX;
-    for (uint32_t i = 0; i < d->mem.memoryTypeCount && type == UINT32_MAX; i++)
-        if ((req.memoryTypeBits & (1u << i)) &&
-            (d->mem.memoryTypes[i].propertyFlags & VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT))
-            type = i;
-    for (uint32_t i = 0; i < d->mem.memoryTypeCount && type == UINT32_MAX; i++)
-        if (req.memoryTypeBits & (1u << i))
-            type = i;
+    uint32_t type = mem_type(d, req.memoryTypeBits);
     VkMemoryAllocateInfo ai = {
         .sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO,
         .allocationSize = req.size,
@@ -543,6 +555,24 @@ static bool img_create(struct dev *d, struct img *im, VkFormat fmt, VkExtent2D s
         return false;
     im->view = view_create(d, im->image, fmt, 0, mips);
     return im->view != VK_NULL_HANDLE;
+}
+
+static bool buffer_create(struct dev *d, VkBuffer *buf, VkDeviceMemory *mem, VkDeviceSize size,
+                          VkBufferUsageFlags usage)
+{
+    VkBufferCreateInfo ci = { .sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO, .size = size, .usage = usage };
+    if (d->CreateBuffer(d->handle, &ci, NULL, buf) != VK_SUCCESS)
+        return false;
+    VkMemoryRequirements req;
+    d->GetBufferMemoryRequirements(d->handle, *buf, &req);
+    uint32_t type = mem_type(d, req.memoryTypeBits);
+    VkMemoryAllocateInfo ai = {
+        .sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO,
+        .allocationSize = req.size,
+        .memoryTypeIndex = type,
+    };
+    return type != UINT32_MAX && d->AllocateMemory(d->handle, &ai, NULL, mem) == VK_SUCCESS &&
+           d->BindBufferMemory(d->handle, *buf, *mem, 0) == VK_SUCCESS;
 }
 
 static void img_free(struct dev *d, struct img *im)
@@ -556,7 +586,8 @@ static void img_free(struct dev *d, struct img *im)
     *im = (struct img){ 0 };
 }
 
-// A descriptor set for pipeline `pipe`, binding views[i] to binding i.
+// A descriptor set for pipeline `pipe`, binding views[i] to binding i; storage buffer
+// bindings (the last ones) get the swapchain's scene-cut counter.
 static VkDescriptorSet ds_make(struct swapchain *sc, int pipe, const VkImageView *views)
 {
     struct dev *d = sc->dev;
@@ -571,16 +602,20 @@ static VkDescriptorSet ds_make(struct swapchain *sc, int pipe, const VkImageView
     if (d->AllocateDescriptorSets(d->handle, &ai, &set) != VK_SUCCESS)
         return VK_NULL_HANDLE;
     VkDescriptorImageInfo ii[5];
+    VkDescriptorBufferInfo bi = { sc->cut, 0, VK_WHOLE_SIZE };
     VkWriteDescriptorSet w[5];
     for (uint32_t i = 0; i < p->n; i++) {
-        ii[i] = (VkDescriptorImageInfo){ d->sampler, views[i], VK_IMAGE_LAYOUT_GENERAL };
+        bool buf = p->types[i] == VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+        if (!buf)
+            ii[i] = (VkDescriptorImageInfo){ d->sampler, views[i], VK_IMAGE_LAYOUT_GENERAL };
         w[i] = (VkWriteDescriptorSet){
             .sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
             .dstSet = set,
             .dstBinding = i,
             .descriptorCount = 1,
             .descriptorType = p->types[i],
-            .pImageInfo = &ii[i],
+            .pImageInfo = buf ? NULL : &ii[i],
+            .pBufferInfo = buf ? &bi : NULL,
         };
     }
     d->UpdateDescriptorSets(d->handle, p->n, w, 0, NULL);
@@ -646,6 +681,12 @@ static void flow_free(struct swapchain *sc)
         img_free(d, &sc->mvl[l]);
     for (int k = 0; k < MAX_GEN; k++)
         img_free(d, &sc->out[k]);
+    if (sc->cut)
+        d->DestroyBuffer(dev, sc->cut, NULL);
+    if (sc->cut_mem)
+        d->FreeMemory(dev, sc->cut_mem, NULL);
+    sc->cut = VK_NULL_HANDLE;
+    sc->cut_mem = VK_NULL_HANDLE;
     sc->dpool = VK_NULL_HANDLE;
     memset(sc->pyr_level, 0, sizeof(sc->pyr_level));
     sc->flow_built = false;
@@ -695,7 +736,7 @@ static bool ring_build(struct swapchain *sc, uint32_t family)
         VkQueryPoolCreateInfo qci = {
             .sType = VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO,
             .queryType = VK_QUERY_TYPE_TIMESTAMP,
-            .queryCount = 2 * RING,
+            .queryCount = NTS * RING,
         };
         d->CreateQueryPool(dev, &qci, NULL, &sc->queries);
     }
@@ -747,14 +788,20 @@ static bool flow_build(struct swapchain *sc, float flow_scale)
         if (!img_create(d, &sc->out[k], VK_FORMAT_R32_UINT, full, 1, VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT))
             return false;
 
+    if (!buffer_create(d, &sc->cut, &sc->cut_mem, 16,
+                       VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT |
+                           VK_BUFFER_USAGE_TRANSFER_SRC_BIT))
+        return false;
+
     VkDescriptorPoolSize sizes[] = {
         { VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 2 * (1 + MAX_LEVELS + 4 * MAX_LEVELS + 1 + 3 * MAX_GEN) },
         { VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 2 * (1 + MAX_LEVELS + MAX_LEVELS + 1 + MAX_GEN) },
+        { VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 2 * (1 + MAX_GEN) },
     };
     VkDescriptorPoolCreateInfo dci = {
         .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO,
         .maxSets = 2 * (1 + MAX_LEVELS + MAX_LEVELS + 1 + MAX_GEN),
-        .poolSizeCount = 2,
+        .poolSizeCount = 3,
         .pPoolSizes = sizes,
     };
     if (d->CreateDescriptorPool(dev, &dci, NULL, &sc->dpool) != VK_SUCCESS)
@@ -846,9 +893,14 @@ static void record(struct swapchain *sc, VkCommandBuffer cmd, int slot, uint32_t
     };
     d->BeginCommandBuffer(cmd, &bi);
     if (sc->queries) {
-        d->CmdResetQueryPool(cmd, sc->queries, 2 * slot, 2);
-        d->CmdWriteTimestamp(cmd, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, sc->queries, 2 * slot);
+        d->CmdResetQueryPool(cmd, sc->queries, NTS * slot, NTS);
+        d->CmdWriteTimestamp(cmd, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, sc->queries, NTS * slot + TS_START);
     }
+#define STAMP(ts) \
+    do { \
+        if (sc->queries) \
+            d->CmdWriteTimestamp(cmd, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, sc->queries, NTS * slot + (ts)); \
+    } while (0)
 
     if (sc->fresh) {
         // all our images live in GENERAL
@@ -890,8 +942,10 @@ static void record(struct swapchain *sc, VkCommandBuffer cmd, int slot, uint32_t
     image_barrier(d, cmd, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT,
                   layout_change(sc->images[idx], VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
                                 VK_IMAGE_LAYOUT_PRESENT_SRC_KHR, 0, 0));
+    if (ngen && flow)
+        d->CmdFillBuffer(cmd, sc->cut, 0, VK_WHOLE_SIZE, 0);  // filter.comp counts afresh
     barrier(d, cmd, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_TRANSFER_WRITE_BIT,
-            VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_ACCESS_SHADER_READ_BIT);
+            VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT);
 
     // 2. its luma pyramid
     int32_t bgr = sc->bgr;
@@ -902,6 +956,7 @@ static void record(struct swapchain *sc, VkCommandBuffer cmd, int slot, uint32_t
         run(d, cmd, P_DOWN, sc->ds_down[c][l], &src, sizeof(src), sc->luma[l]);
     }
     compute_to_compute(d, cmd);
+    STAMP(TS_PYRAMID);
 
     if (ngen) {
         // 3. motion, coarse to fine, then the median filter into mvf[c]
@@ -922,6 +977,7 @@ static void record(struct swapchain *sc, VkCommandBuffer cmd, int slot, uint32_t
             run(d, cmd, P_FILTER, sc->ds_filter[c], NULL, 0, sc->mv[0]);
             compute_to_compute(d, cmd);
         }
+        STAMP(TS_MOTION);
 
         // 4. the in-between frames
         for (uint32_t k = 0; k < ngen; k++) {
@@ -938,6 +994,7 @@ static void record(struct swapchain *sc, VkCommandBuffer cmd, int slot, uint32_t
             };
             run(d, cmd, P_SYNTH, sc->ds_synth[c][k], &pc, sizeof(pc), full);
         }
+        STAMP(TS_SYNTH);
         barrier(d, cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_ACCESS_SHADER_WRITE_BIT,
                 VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_TRANSFER_READ_BIT);
         for (uint32_t k = 0; k < ngen; k++) {
@@ -953,8 +1010,12 @@ static void record(struct swapchain *sc, VkCommandBuffer cmd, int slot, uint32_t
         }
     }
 
-    if (sc->queries)
-        d->CmdWriteTimestamp(cmd, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, sc->queries, 2 * slot + 1);
+    if (!ngen) {
+        STAMP(TS_MOTION);
+        STAMP(TS_SYNTH);
+    }
+    STAMP(TS_OUTPUT);
+#undef STAMP
     d->EndCommandBuffer(cmd);
 }
 
@@ -976,7 +1037,7 @@ static void dump(struct swapchain *sc, struct frame *f, uint32_t ngen, const cha
     VkDeviceSize one = (VkDeviceSize)w * h * 4;
     VkBufferCreateInfo bci = {
         .sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO,
-        .size = one * n,
+        .size = one * n + 16,  // + the scene-cut counter
         .usage = VK_BUFFER_USAGE_TRANSFER_DST_BIT,
     };
     VkBuffer buf = VK_NULL_HANDLE;
@@ -1024,6 +1085,8 @@ static void dump(struct swapchain *sc, struct frame *f, uint32_t ngen, const cha
         };
         d->CmdCopyImageToBuffer(cmd, src[i], VK_IMAGE_LAYOUT_GENERAL, buf, 1, &r);
     }
+    VkBufferCopy cr = { 0, one * n, 4 };
+    d->CmdCopyBuffer(cmd, sc->cut, buf, 1, &cr);
     barrier(d, cmd, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_TRANSFER_WRITE_BIT, VK_PIPELINE_STAGE_HOST_BIT,
             VK_ACCESS_HOST_READ_BIT);
     d->EndCommandBuffer(cmd);
@@ -1060,7 +1123,8 @@ static void dump(struct swapchain *sc, struct frame *f, uint32_t ngen, const cha
         }
         fclose(o);
     }
-    say("dumped %u frames of present %llu to %s", n, (unsigned long long)sc->count, dir);
+    say("dumped %u frames of present %llu to %s (%u of %u blocks unmatched)", n, (unsigned long long)sc->count, dir,
+        px[(size_t)w * h * n], sc->mv[0].width * sc->mv[0].height);
 out:
     if (fence)
         d->DestroyFence(dev, fence, NULL);
@@ -1075,21 +1139,28 @@ out:
 static void stats(struct swapchain *sc, int slot, int multiplier)
 {
     struct dev *d = sc->dev;
-    uint64_t ts[2];
-    if (!sc->queries || d->GetQueryPoolResults(d->handle, sc->queries, 2 * slot, 2, sizeof(ts), ts, sizeof(ts[0]),
-                                               VK_QUERY_RESULT_64_BIT) != VK_SUCCESS)
+    uint64_t ts[NTS];
+    if (!sc->queries || d->GetQueryPoolResults(d->handle, sc->queries, NTS * slot, NTS, sizeof(ts), ts,
+                                               sizeof(ts[0]), VK_QUERY_RESULT_64_BIT) != VK_SUCCESS)
         return;
     uint32_t bits = d->families[sc->family].timestampValidBits;
     uint64_t mask = bits >= 64 ? UINT64_MAX : (1ull << bits) - 1;
-    sc->gpu_ms += ((ts[1] - ts[0]) & mask) * d->ts_period * 1e-6;
+    double ms = d->ts_period * 1e-6;
+    sc->gpu_ms[0] += ((ts[NTS - 1] - ts[0]) & mask) * ms;
+    for (int i = 1; i < NTS; i++)
+        sc->gpu_ms[i] += ((ts[i] - ts[i - 1]) & mask) * ms;
     sc->gpu_n++;
     double t = now_s();
     if (t - sc->stat_t >= 2.0) {
+        double n = sc->gpu_n;
         if (sc->stat_t > 0)
-            say("%.1f rendered fps, %.1f shown, %.2f ms GPU per rendered frame (%dx)", sc->gpu_n / (t - sc->stat_t),
-                sc->shown / (t - sc->stat_t), sc->gpu_ms / sc->gpu_n, multiplier);
+            say("%.1f rendered fps, %.1f shown (%dx): %.2f ms GPU per rendered frame = copy+pyramid %.2f, "
+                "motion %.2f, generate %.2f, output %.2f",
+                n / (t - sc->stat_t), sc->shown / (t - sc->stat_t), multiplier, sc->gpu_ms[0] / n,
+                sc->gpu_ms[TS_PYRAMID] / n, sc->gpu_ms[TS_MOTION] / n, sc->gpu_ms[TS_SYNTH] / n,
+                sc->gpu_ms[TS_OUTPUT] / n);
         sc->stat_t = t;
-        sc->gpu_ms = 0;
+        memset(sc->gpu_ms, 0, sizeof(sc->gpu_ms));
         sc->gpu_n = sc->shown = 0;
     }
 }

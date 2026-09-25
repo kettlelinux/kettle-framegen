@@ -1,11 +1,19 @@
 // SPDX-License-Identifier: BSD-3-Clause
 // Final vector field: 3x3 vector median of level 0 (the vector closest to all its neighbours),
 // which drops lone wrong matches without blurring motion edges.
+// Also counts the blocks whose best match is still poor (mean luma difference above
+// BAD_COST): when most are, the frames are unrelated (a scene cut) and synth.comp stops
+// interpolating.
 #version 450
 layout(local_size_x = 8, local_size_y = 8) in;
 
 layout(binding = 0) uniform sampler2D src;
 layout(binding = 1, rgba16f) uniform writeonly image2D dst;
+layout(binding = 2) buffer Cut {
+    uint bad_blocks;
+} cut;
+
+const float BAD_COST = 0.08;  // motion.comp stores the mean per-sample difference in .z
 
 void main()
 {
@@ -30,4 +38,6 @@ void main()
         }
     }
     imageStore(dst, b, v[best]);
+    if (v[4].z > BAD_COST)
+        atomicAdd(cut.bad_blocks, 1u);
 }
