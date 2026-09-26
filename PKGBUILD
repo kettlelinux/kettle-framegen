@@ -1,6 +1,6 @@
 # Kettle Linux's own frame generation: an implicit Vulkan layer (VK_LAYER_KETTLE_framegen) that
-# interpolates frames on the game's own device, no Lossless Scaling needed. Sources live next to
-# this PKGBUILD. Off unless KETTLE_FG=1, which the Frame Generation plugin sets per game.
+# interpolates frames on the game's own device. Sources live next to this PKGBUILD. Off unless
+# KETTLE_FG=1, which the Frame Generation plugin sets per game.
 # Proton ARM64 games (x86 code via FEX inside Wine) use the native aarch64 Vulkan loader, so
 # this one layer covers them and native arm64 games.
 pkgname=kettle-framegen

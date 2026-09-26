@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: BSD-3-Clause
 // VK_LAYER_KETTLE_framegen: frame generation for Vulkan games (Proton's DXVK and vkd3d-proton
-// included), Kettle Linux's own replacement for lsfg-vk.
+// included), Kettle Linux's own.
 //
 // Everything runs on the game's own VkDevice and present queue: no second device and no
 // images shared between devices. On each vkQueuePresentKHR the layer
