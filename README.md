@@ -42,9 +42,9 @@ KETTLE_FG=1 %command%
 
 ## Settings
 
-Settings come from a per-game file of `key = value` lines (`#` starts a comment). The layer
-rereads the file while the game runs, so changes apply without a restart, except the two
-marked below. The file is the first of:
+Settings come from a per-game file of `key = value` lines (`#` at the start of a line or after
+whitespace starts a comment). The layer rereads the file while the game runs, so changes apply
+without a restart, except the two marked below. The file is the first of:
 
 - `$KETTLE_FG_CONFIG`
 - `$XDG_CONFIG_HOME/kettle-framegen/<SteamAppId>.conf`

@@ -126,8 +126,15 @@ static void config_load(void)
     if (f) {
         char line[256];
         while (fgets(line, sizeof(line), f)) {
+            // `#` starts a comment at the start of a line or after whitespace (a dump path
+            // may contain one)
+            for (char *h = line; (h = strchr(h, '#')); h++)
+                if (h == line || isspace((unsigned char)h[-1])) {
+                    *h = 0;
+                    break;
+                }
             char *eq = strchr(line, '=');
-            if (line[0] == '#' || !eq)
+            if (!eq)
                 continue;
             *eq = 0;
             config_set(&c, trim(line), trim(eq + 1));
@@ -416,10 +423,8 @@ static const void *find_struct(const void *chain, VkStructureType type)
 
 // ---------- GPU resources ----------
 
-static bool dev_pipelines(struct dev *d)
+static bool pipelines_create(struct dev *d)
 {
-    if (d->pipes_ready)
-        return true;
     VkSamplerCreateInfo si = {
         .sType = VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO,
         .magFilter = VK_FILTER_LINEAR,
@@ -479,8 +484,19 @@ static bool dev_pipelines(struct dev *d)
         if (r != VK_SUCCESS)
             return false;
     }
-    d->pipes_ready = true;
     return true;
+}
+
+// The shared pipelines, created once; swapchains presenting from other threads may ask at once
+static bool dev_pipelines(struct dev *d)
+{
+    static pthread_mutex_t pipes_lock = PTHREAD_MUTEX_INITIALIZER;
+    pthread_mutex_lock(&pipes_lock);
+    if (!d->pipes_ready)
+        d->pipes_ready = pipelines_create(d);
+    bool ok = d->pipes_ready;
+    pthread_mutex_unlock(&pipes_lock);
+    return ok;
 }
 
 static void dev_free_pipelines(struct dev *d)
@@ -1023,7 +1039,7 @@ static void record(struct swapchain *sc, VkCommandBuffer cmd, int slot, uint32_t
 // <dir>/kettle-fg-<present>-<i>.ppm. Taken at present KETTLE_FG_DUMP_FRAME (default 300) with
 // KETTLE_FG_DUMP=<dir>, or at the next present after the game's settings file gains (or is
 // rewritten with) a `dump = <dir>` line: no restart needed.
-static void dump(struct swapchain *sc, struct frame *f, uint32_t ngen, const char *dir)
+static void dump(struct swapchain *sc, struct frame *f, VkQueue queue, uint32_t ngen, const char *dir)
 {
     struct dev *d = sc->dev;
     VkDevice dev = d->handle;
@@ -1091,12 +1107,8 @@ static void dump(struct swapchain *sc, struct frame *f, uint32_t ngen, const cha
             VK_ACCESS_HOST_READ_BIT);
     d->EndCommandBuffer(cmd);
     VkSubmitInfo si = { .sType = VK_STRUCTURE_TYPE_SUBMIT_INFO, .commandBufferCount = 1, .pCommandBuffers = &cmd };
-    VkQueue q = VK_NULL_HANDLE;
-    for (uint32_t i = 0; i < d->nqueues && !q; i++)
-        if (d->queues[i].family == sc->family)
-            q = d->queues[i].queue;
     d->WaitForFences(dev, 1, &f->fence, VK_TRUE, UINT64_MAX);
-    if (!q || d->QueueSubmit(q, 1, &si, fence) != VK_SUCCESS)
+    if (d->QueueSubmit(queue, 1, &si, fence) != VK_SUCCESS)
         goto out;
     d->WaitForFences(dev, 1, &fence, VK_TRUE, UINT64_MAX);
 
@@ -1165,6 +1177,19 @@ static void stats(struct swapchain *sc, int slot, int multiplier)
     }
 }
 
+static void present_image(struct swapchain *sc, VkQueue queue, uint32_t image, VkSemaphore wait)
+{
+    VkPresentInfoKHR pi = {
+        .sType = VK_STRUCTURE_TYPE_PRESENT_INFO_KHR,
+        .waitSemaphoreCount = 1,
+        .pWaitSemaphores = &wait,
+        .swapchainCount = 1,
+        .pSwapchains = &sc->handle,
+        .pImageIndices = &image,
+    };
+    sc->dev->QueuePresentKHR(queue, &pi);
+}
+
 static VKAPI_ATTR VkResult VKAPI_CALL QueuePresentKHR(VkQueue queue, const VkPresentInfoKHR *pi)
 {
     struct dev *d = find_dev(KEY(queue));
@@ -1201,6 +1226,17 @@ static VKAPI_ATTR VkResult VKAPI_CALL QueuePresentKHR(VkQueue queue, const VkPre
         if (c.stats)
             stats(sc, slot, c.multiplier);
     }
+
+    // Allocated before any image is acquired, so failing here leaves nothing to hand back
+    uint32_t nwait_max = pi->waitSemaphoreCount + MAX_GEN;
+    VkSemaphore *waits = malloc(nwait_max * sizeof(*waits));
+    VkPipelineStageFlags *stages = malloc(nwait_max * sizeof(*stages));
+    if (!waits || !stages) {
+        free(waits);
+        free(stages);
+        sc->have_prev = sc->have_mv = false;
+        return d->QueuePresentKHR(queue, pi);
+    }
     d->ResetFences(dev, 1, &f->fence);
 
     // Spare images for the generated frames. Waiting here is FIFO pacing at work; a timeout
@@ -1227,17 +1263,11 @@ static VKAPI_ATTR VkResult VKAPI_CALL QueuePresentKHR(VkQueue queue, const VkPre
         ngen++;
     }
 
+    bool fresh = sc->fresh;
     record(sc, f->cmd, slot, idx, acq, ngen, c.multiplier, c.flow);
 
     // The game's wait semaphores gate our copy of its frame; its present then waits for us.
     uint32_t nwait = pi->waitSemaphoreCount + ngen;
-    VkSemaphore *waits = malloc(nwait * sizeof(*waits));
-    VkPipelineStageFlags *stages = malloc(nwait * sizeof(*stages));
-    if (!waits || !stages) {
-        free(waits);
-        free(stages);
-        return VK_ERROR_OUT_OF_HOST_MEMORY;
-    }
     for (uint32_t i = 0; i < pi->waitSemaphoreCount; i++)
         waits[i] = pi->pWaitSemaphores[i];
     for (uint32_t k = 0; k < ngen; k++)
@@ -1261,30 +1291,29 @@ static VKAPI_ATTR VkResult VKAPI_CALL QueuePresentKHR(VkQueue queue, const VkPre
     VkResult r = d->QueueSubmit(queue, 1, &si, f->fence);
     free(waits);
     free(stages);
-    if (r != VK_SUCCESS)
-        return r;
+    if (r != VK_SUCCESS) {
+        // A failed submit leaves its semaphores as they were. Hand the acquired images back
+        // (their presents consume the acquire semaphores; they show stale contents) and present
+        // the game's frame as it asked, or the swapchain runs out of images.
+        sc->fresh = fresh;  // its layout transitions didn't run
+        sc->have_prev = sc->have_mv = false;
+        for (uint32_t k = 0; k < ngen; k++)
+            present_image(sc, queue, acq[k], f->acquired[k]);
+        return d->QueuePresentKHR(queue, pi);
+    }
     f->pending = true;
     if (ngen && getenv("KETTLE_FG_DUMP")) {
         const char *at = getenv("KETTLE_FG_DUMP_FRAME");
         if (sc->count == (uint64_t)(at ? atoll(at) : 300))
-            dump(sc, f, ngen, getenv("KETTLE_FG_DUMP"));
+            dump(sc, f, queue, ngen, getenv("KETTLE_FG_DUMP"));
     }
     if (ngen && c.dump[0] && c.dump_serial != sc->dump_serial) {
         sc->dump_serial = c.dump_serial;
-        dump(sc, f, ngen, c.dump);
+        dump(sc, f, queue, ngen, c.dump);
     }
 
-    for (uint32_t k = 0; k < ngen; k++) {
-        VkPresentInfoKHR gen = {
-            .sType = VK_STRUCTURE_TYPE_PRESENT_INFO_KHR,
-            .waitSemaphoreCount = 1,
-            .pWaitSemaphores = &sc->present_sems[acq[k]],
-            .swapchainCount = 1,
-            .pSwapchains = &sc->handle,
-            .pImageIndices = &acq[k],
-        };
-        d->QueuePresentKHR(queue, &gen);
-    }
+    for (uint32_t k = 0; k < ngen; k++)
+        present_image(sc, queue, acq[k], sc->present_sems[acq[k]]);
     VkPresentInfoKHR real = *pi;
     real.waitSemaphoreCount = 1;
     real.pWaitSemaphores = &sc->present_sems[idx];
