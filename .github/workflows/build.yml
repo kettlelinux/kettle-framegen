@@ -8,6 +8,13 @@ jobs:
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
-      - run: sudo apt-get update && sudo apt-get install -y glslang-tools libvulkan-dev
+      - run: sudo apt-get update && sudo apt-get install -y glslang-tools libvulkan-dev mesa-vulkan-drivers
       - run: make
+      # the shaders on lavapipe (no GPU on the runners) against test/cases' references
+      - run: make test FGTEST_FLAGS="-o $PWD/fgtest-out"
+      - if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: fgtest-out-${{ matrix.os }}
+          path: fgtest-out
       - run: make install DESTDIR="$PWD/stage" && find stage -type f

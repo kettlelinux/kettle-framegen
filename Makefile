@@ -2,6 +2,8 @@
 #   make
 #   make install DESTDIR=... PREFIX=/usr
 #   make CFLAGS=-I/path/to/Vulkan-Headers/include   (without system vulkan-headers)
+#   make test          run test/cases through the shaders, compare with their references
+#   make test-update   make the current output the references (review the images first)
 CC ?= cc
 GLSLANG ?= glslangValidator
 CFLAGS ?= -O2
@@ -10,6 +12,8 @@ LIBDIR ?= $(PREFIX)/lib
 SHADERS := luma0 down motion filter synth
 HEADERS := $(SHADERS:%=build/%.spv.h)
 LIB := build/libVkLayer_kettle_framegen.so
+FGTEST := build/fgtest
+CASES ?= $(wildcard test/cases/*)
 
 all: $(LIB)
 
@@ -17,9 +21,19 @@ build/%.spv.h: shaders/%.comp
 	@mkdir -p build
 	$(GLSLANG) -V --target-env vulkan1.0 --vn spv_$* -o $@ $<
 
-$(LIB): framegen.c $(HEADERS)
+$(LIB): framegen.c shaders.h $(HEADERS)
 	$(CC) $(CFLAGS) -std=c11 -D_GNU_SOURCE -Wall -Wextra -Werror -fPIC -shared -fvisibility=hidden \
 	  -Ibuild $(LDFLAGS) -o $@ framegen.c -lpthread -lm
+
+$(FGTEST): test/fgtest.c shaders.h $(HEADERS)
+	$(CC) $(CFLAGS) -std=c11 -D_GNU_SOURCE -Wall -Wextra -Werror -I. -Ibuild $(LDFLAGS) -o $@ test/fgtest.c \
+	  -lvulkan -lm
+
+test: $(FGTEST)
+	$(FGTEST) $(FGTEST_FLAGS) $(CASES)
+
+test-update: $(FGTEST)
+	$(FGTEST) -u $(CASES)
 
 install: $(LIB)
 	install -Dm755 $(LIB) -t $(DESTDIR)$(LIBDIR)
@@ -30,4 +44,4 @@ install: $(LIB)
 clean:
 	rm -rf build
 
-.PHONY: all install clean
+.PHONY: all install clean test test-update

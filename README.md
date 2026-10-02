@@ -29,6 +29,43 @@ sudo make install            # PREFIX=/usr by default; DESTDIR and LIBDIR work a
 This installs `libVkLayer_kettle_framegen.so` and its manifest in
 `$PREFIX/share/vulkan/implicit_layer.d`.
 
+## Testing
+
+`make test` runs the cases in `test/cases` through the shaders on a headless Vulkan device and
+compares the generated frames with stored references. It needs the Vulkan loader and a driver;
+without a GPU, Mesa's lavapipe works (CI uses it). `FGTEST_DEVICE=<n>` picks another device.
+
+```
+$ make test
+build/fgtest  test/cases/blend test/cases/cut ...
+device: llvmpipe (LLVM 21.1.8, 256 bits)
+...
+object          1-1   cut  0.7%  truth  32.19 dB  ref  63.97 dB   0.00% off  ok
+...
+10 of 10 cases passed
+```
+
+Per generated frame: the share of blocks no vector matched (above 30% counts as a scene cut),
+the PSNR against the true in-between frame, and the PSNR and share of pixels off by more than
+24 against the reference.
+
+Each case is a directory of frames (`0.ppm`, `1.ppm`, ...), an optional `case.conf`
+(`multiplier`, `flow_scale`, `mode`, and the tolerances `min_psnr` and `max_bad`), the
+references in `ref/` and, for the synthetic cases, the true in-between frames in `truth/`. The
+PSNR against the truth measures quality; the references catch changes. Drivers round
+differently, so a frame passes when it is close to its reference, not identical: see
+[test/fgtest.c](test/fgtest.c).
+
+After a change that is meant to alter the output, look at the new frames (`make test
+FGTEST_FLAGS="-o out"` writes them, with difference images for the failures), check that the
+truth PSNRs didn't drop, then `make test-update` to replace the references. `CASES=...` limits
+either to some cases.
+
+The synthetic cases come from `test/make-cases.py`. To add a case from a game, set `dump` (see
+below) and copy the first and last frame of the dump to a new case as `0.ppm` and `1.ppm`, with
+`multiplier` set to the number of frames the dump holds minus one; then `make test-update
+CASES=test/cases/<name>`.
+
 ## Using it
 
 The layer stays off unless the game's environment has `KETTLE_FG=1`. On Steam, set it per game

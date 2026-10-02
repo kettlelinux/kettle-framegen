@@ -29,20 +29,14 @@
 #include <vulkan/vulkan.h>
 #include <vulkan/vk_layer.h>
 
-#include "luma0.spv.h"
-#include "down.spv.h"
-#include "motion.spv.h"
-#include "filter.spv.h"
-#include "synth.spv.h"
+#include "shaders.h"
 
 #define EXPORT __attribute__((visibility("default")))
 #define LAYER "VK_LAYER_KETTLE_framegen"
 #define KEY(h) (*(void **)(h))
 #define MAX_GEN 3          // generated frames per rendered one (4x)
 #define RING 3             // presents in flight
-#define MAX_LEVELS 7
 #define MAX_QUEUES 64
-#define BLOCK 8            // motion block size, pixels (motion.comp B)
 // GPU timestamps per present: start, then the end of each stage
 enum { TS_START, TS_PYRAMID, TS_MOTION, TS_SYNTH, TS_OUTPUT, NTS };
 #define ACQUIRE_TIMEOUT 100000000ull  // ns
@@ -240,28 +234,6 @@ struct inst {
     X(CreateBuffer) X(DestroyBuffer) X(GetBufferMemoryRequirements) X(BindBufferMemory)       \
     X(MapMemory) X(CmdCopyImageToBuffer) X(FreeCommandBuffers) X(CmdFillBuffer) X(CmdCopyBuffer)
 
-enum { P_LUMA, P_DOWN, P_MOTION, P_FILTER, P_SYNTH, NPIPE };
-#define PUSH_SIZE 32
-
-#define S VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER
-#define W VK_DESCRIPTOR_TYPE_STORAGE_IMAGE
-#define B VK_DESCRIPTOR_TYPE_STORAGE_BUFFER  // always the swapchain's scene-cut counter
-static const struct pipe_spec {
-    const uint32_t *code;
-    size_t size;
-    uint32_t n;
-    VkDescriptorType types[5];
-} pipe_specs[NPIPE] = {
-    [P_LUMA] = { spv_luma0, sizeof(spv_luma0), 2, { S, W } },
-    [P_DOWN] = { spv_down, sizeof(spv_down), 2, { S, W } },
-    [P_MOTION] = { spv_motion, sizeof(spv_motion), 5, { S, S, S, S, W } },
-    [P_FILTER] = { spv_filter, sizeof(spv_filter), 3, { S, W, B } },
-    [P_SYNTH] = { spv_synth, sizeof(spv_synth), 5, { S, S, S, W, B } },
-};
-#undef S
-#undef W
-#undef B
-
 struct dev {
     struct dev *next;
     void *key;
@@ -425,17 +397,7 @@ static const void *find_struct(const void *chain, VkStructureType type)
 
 static bool pipelines_create(struct dev *d)
 {
-    VkSamplerCreateInfo si = {
-        .sType = VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO,
-        .magFilter = VK_FILTER_LINEAR,
-        .minFilter = VK_FILTER_LINEAR,
-        .mipmapMode = VK_SAMPLER_MIPMAP_MODE_NEAREST,
-        .addressModeU = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE,
-        .addressModeV = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE,
-        .addressModeW = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE,
-        .maxLod = VK_LOD_CLAMP_NONE,
-    };
-    if (!d->sampler && d->CreateSampler(d->handle, &si, NULL, &d->sampler) != VK_SUCCESS)
+    if (!d->sampler && d->CreateSampler(d->handle, &sampler_info, NULL, &d->sampler) != VK_SUCCESS)
         return false;
     for (int p = 0; p < NPIPE; p++) {
         if (d->pipe[p])
@@ -768,19 +730,9 @@ static bool flow_build(struct swapchain *sc, float flow_scale)
     if (!dev_pipelines(d))
         return false;
 
-    // luma pyramid: level 0 at flow_scale, halving down to ~24 pixels on the short side
     VkExtent2D full = sc->extent;
-    VkExtent2D l0 = {
-        fmaxf(16.0f, roundf(full.width * flow_scale)),
-        fmaxf(16.0f, roundf(full.height * flow_scale)),
-    };
-    sc->levels = 1;
-    while (sc->levels < MAX_LEVELS && (l0.width >> sc->levels) >= 24 && (l0.height >> sc->levels) >= 24)
-        sc->levels++;
-    for (uint32_t l = 0; l < sc->levels; l++) {
-        sc->luma[l] = (VkExtent2D){ l0.width >> l, l0.height >> l };
-        sc->mv[l] = (VkExtent2D){ (sc->luma[l].width + BLOCK - 1) / BLOCK, (sc->luma[l].height + BLOCK - 1) / BLOCK };
-    }
+    sc->levels = flow_geometry(full, flow_scale, sc->luma, sc->mv);
+    VkExtent2D l0 = sc->luma[0];
 
     // History holds raw copies of the swapchain's 32-bit pixels, whatever their channel order
     // or encoding. Generated frames are R32_UINT that synth.comp packs in the swapchain's
@@ -978,15 +930,7 @@ static void record(struct swapchain *sc, VkCommandBuffer cmd, int slot, uint32_t
         // 3. motion, coarse to fine, then the median filter into mvf[c]
         if (flow) {
             for (int l = sc->levels - 1; l >= 0; l--) {
-                struct {
-                    float luma_size[2], mv0_size[2];
-                    int32_t level, coarsest, use_temporal;
-                    float lambda;
-                } pc = {
-                    { sc->luma[l].width, sc->luma[l].height },
-                    { sc->mv[0].width, sc->mv[0].height },
-                    l, l == (int)sc->levels - 1, sc->have_mv, 0.01f,
-                };
+                struct motion_pc pc = motion_push(sc->luma, sc->mv, sc->levels, l, sc->have_mv);
                 run(d, cmd, P_MOTION, sc->ds_motion[c][l], &pc, sizeof(pc), sc->mv[l]);
                 compute_to_compute(d, cmd);
             }
@@ -997,17 +941,8 @@ static void record(struct swapchain *sc, VkCommandBuffer cmd, int slot, uint32_t
 
         // 4. the in-between frames
         for (uint32_t k = 0; k < ngen; k++) {
-            struct {
-                float size[2], mv_uv[2], mv_to_px[2], t;
-                int32_t flags;
-            } pc = {
-                { full.width, full.height },
-                { (float)sc->luma[0].width / (full.width * BLOCK * sc->mv[0].width),
-                  (float)sc->luma[0].height / (full.height * BLOCK * sc->mv[0].height) },
-                { (float)full.width / sc->luma[0].width, (float)full.height / sc->luma[0].height },
-                (k + 1.0f) / multiplier,
-                (flow ? 1 : 0) | (sc->hist_format == VK_FORMAT_A2B10G10R10_UNORM_PACK32 ? 2 : 0),
-            };
+            struct synth_pc pc = synth_push(full, sc->luma, sc->mv, (k + 1.0f) / multiplier, flow,
+                                            sc->hist_format == VK_FORMAT_A2B10G10R10_UNORM_PACK32);
             run(d, cmd, P_SYNTH, sc->ds_synth[c][k], &pc, sizeof(pc), full);
         }
         STAMP(TS_SYNTH);
