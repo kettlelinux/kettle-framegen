@@ -29,6 +29,24 @@ sudo make install            # PREFIX=/usr by default; DESTDIR and LIBDIR work a
 This installs `libVkLayer_kettle_framegen.so` and its manifest in
 `$PREFIX/share/vulkan/implicit_layer.d`.
 
+### 32-bit games
+
+32-bit games, including older ones that run through Proton, load 32-bit Vulkan layers, so on
+x86_64 they also need a 32-bit copy of the layer. Building it needs a multilib compiler
+(`lib32-gcc-libs` on Arch, `gcc-multilib` on Debian and Ubuntu):
+
+```sh
+make lib32
+sudo make install-lib32      # LIB32DIR=$PREFIX/lib32 by default
+```
+
+This installs the library in `$LIB32DIR` and a second manifest,
+`VkLayer_kettle_framegen_32.json`, for a layer named `VK_LAYER_KETTLE_framegen_32`. The Vulkan
+loader picks layers by name, so the two copies need different names. Each game then loads
+the copy that matches its own architecture. `make install-lib32` takes the same `PREFIX`,
+`DESTDIR`, `CC` and `CFLAGS` as `make install`, and `CFLAGS32` (default `-m32`) holds the
+32-bit flags.
+
 ## Using it
 
 The layer stays off unless the game's environment has `KETTLE_FG=1`. On Steam, set it per game
