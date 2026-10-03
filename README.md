@@ -113,7 +113,7 @@ example `KETTLE_FG_MULTIPLIER=3`) overrides the file.
 | `multiplier` | `2` | Frames shown per rendered frame, 1 to 4. `1` turns generation off. |
 | `mode` | `motion` | `blend` mixes frames without motion estimation. |
 | `flow_scale` | `0.5` | Resolution of the motion estimate as a fraction of the frame, 0.1 to 1. |
-| `fifo` | `true` | Force FIFO presentation. Read when the swapchain is created. |
+| `fifo` | `true` | Force FIFO presentation, also for games that pick a present mode per frame (DXVK, vkd3d-proton). Read when the swapchain is created. |
 | `preserve_images` | `false` | Add no extra swapchain images. Read when the swapchain is created. |
 | `stats` | `false` | Log GPU time per stage every 2 seconds. |
 | `dump` | unset | Directory to save the next generated frames to, for debugging. |

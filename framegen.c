@@ -279,6 +279,8 @@ struct swapchain {
     VkExtent2D extent;
     VkFormat hist_format;  // swapchain pixels copied raw: RGBA8 or A2B10G10R10
     bool bgr;              // ...holding BGR(A)
+    bool fifo;             // forced to FIFO, also where the game picks a mode per present
+    bool mode_said;        // logged that the game asked for another mode
     VkImage *images;
     uint32_t nimages;
     // Waited on by the present of each image. Per image, not per frame: a present's semaphore
@@ -1125,10 +1127,9 @@ static void present_image(struct swapchain *sc, VkQueue queue, uint32_t image, V
     sc->dev->QueuePresentKHR(queue, &pi);
 }
 
-static VKAPI_ATTR VkResult VKAPI_CALL QueuePresentKHR(VkQueue queue, const VkPresentInfoKHR *pi)
+static VkResult present_frames(VkQueue queue, const VkPresentInfoKHR *pi, struct swapchain *sc)
 {
     struct dev *d = find_dev(KEY(queue));
-    struct swapchain *sc = pi->swapchainCount == 1 ? find_sc(pi->pSwapchains[0], false) : NULL;
     if (!sc || sc->broken)
         return d->QueuePresentKHR(queue, pi);
     VkDevice dev = d->handle;
@@ -1262,6 +1263,30 @@ static VKAPI_ATTR VkResult VKAPI_CALL QueuePresentKHR(VkQueue queue, const VkPre
     return r;
 }
 
+static VKAPI_ATTR VkResult VKAPI_CALL QueuePresentKHR(VkQueue queue, const VkPresentInfoKHR *pi)
+{
+    static const VkPresentModeKHR fifo = VK_PRESENT_MODE_FIFO_KHR;
+    struct swapchain *sc = pi->swapchainCount == 1 ? find_sc(pi->pSwapchains[0], false) : NULL;
+    // A swapchain created with a list of present modes (VK_EXT_swapchain_maintenance1, as DXVK
+    // and vkd3d-proton do) takes a mode with each present, and keeps it for presents that name
+    // none, the layer's own included. Outside FIFO they replace each other instead of queuing,
+    // and generated frames never reach the screen. The game's struct is pointed at FIFO for the
+    // call, then restored.
+    VkSwapchainPresentModeInfoEXT *pm =
+        sc && sc->fifo ? (void *)find_struct(pi->pNext, VK_STRUCTURE_TYPE_SWAPCHAIN_PRESENT_MODE_INFO_EXT) : NULL;
+    if (!pm || pm->pPresentModes[0] == fifo)
+        return present_frames(queue, pi, sc);
+    if (!sc->mode_said) {
+        say("game presents with present mode %d, made FIFO (fifo = true)", pm->pPresentModes[0]);
+        sc->mode_said = true;
+    }
+    const VkPresentModeKHR *asked = pm->pPresentModes;
+    pm->pPresentModes = &fifo;
+    VkResult r = present_frames(queue, pi, sc);
+    pm->pPresentModes = asked;
+    return r;
+}
+
 // ---------- swapchains ----------
 
 // Swapchain formats handled, as the history format their raw bits are copied into
@@ -1322,10 +1347,25 @@ static VKAPI_ATTR VkResult VKAPI_CALL CreateSwapchainKHR(VkDevice device, const 
             ci2.minImageCount = caps.maxImageCount;
         extra = ci2.minImageCount - ci->minImageCount;
     }
-    // generated frames are queued back to back; any mode that replaces queued frames drops them
-    if (c.fifo && !find_struct(ci->pNext, VK_STRUCTURE_TYPE_SWAPCHAIN_PRESENT_MODES_CREATE_INFO_EXT))
+    // generated frames are queued back to back; any mode that replaces queued frames drops them.
+    // A list of modes to switch between per present (see QueuePresentKHR) becomes FIFO alone
+    // for the call; the game's struct is restored after.
+    static const VkPresentModeKHR fifo = VK_PRESENT_MODE_FIFO_KHR;
+    VkSwapchainPresentModesCreateInfoEXT *modes =
+        c.fifo ? (void *)find_struct(ci->pNext, VK_STRUCTURE_TYPE_SWAPCHAIN_PRESENT_MODES_CREATE_INFO_EXT) : NULL;
+    uint32_t nmodes = modes ? modes->presentModeCount : 0;
+    const VkPresentModeKHR *asked = modes ? modes->pPresentModes : NULL;
+    if (c.fifo)
         ci2.presentMode = VK_PRESENT_MODE_FIFO_KHR;
+    if (modes) {
+        modes->presentModeCount = 1;
+        modes->pPresentModes = &fifo;
+    }
     VkResult r = d->CreateSwapchainKHR(device, &ci2, alloc, out);
+    if (modes) {
+        modes->presentModeCount = nmodes;
+        modes->pPresentModes = asked;
+    }
     if (r != VK_SUCCESS)
         return r;
 
@@ -1341,12 +1381,14 @@ static VKAPI_ATTR VkResult VKAPI_CALL CreateSwapchainKHR(VkDevice device, const 
         sc->gen_limit = MAX_GEN;
         sc->dump_serial = c.dump_serial;  // only requests made after it exists
         sc->bgr = bgr;
+        sc->fifo = c.fifo;
         pthread_mutex_lock(&lock);
         sc->next = swapchains;
         swapchains = sc;
         pthread_mutex_unlock(&lock);
-        say("swapchain %ux%u format %d, %u images (%u extra), present mode %d", ci->imageExtent.width,
-            ci->imageExtent.height, ci->imageFormat, sc->nimages, extra, ci2.presentMode);
+        say("swapchain %ux%u format %d, %u images (%u extra), present mode %d%s", ci->imageExtent.width,
+            ci->imageExtent.height, ci->imageFormat, sc->nimages, extra, ci2.presentMode,
+            modes ? " (the game's choice of modes per present taken away)" : "");
     } else if (sc) {
         free(sc->images);
         free(sc->present_sems);
