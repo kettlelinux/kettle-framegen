@@ -26,6 +26,7 @@
 #include <time.h>
 #include <pthread.h>
 #include <sys/stat.h>
+#include <unistd.h>
 #include <vulkan/vulkan.h>
 #include <vulkan/vk_layer.h>
 
@@ -167,6 +168,42 @@ static void config_load(void)
         cfg_dump_serial++;
     c.dump_serial = cfg_dump_serial;
     cfg = c;
+}
+
+// ---------- status ----------
+
+// The multiplier in use, for tools that show it (with multiplier = auto it isn't in the settings):
+// $XDG_RUNTIME_DIR/kettle-framegen/<pid>, "multiplier=<n>", rewritten when it changes.
+static char status_path[4096];
+static int status_mult = -1;
+
+static void status_write(int mult)
+{
+    if (__atomic_exchange_n(&status_mult, mult, __ATOMIC_RELAXED) == mult)
+        return;
+    static pthread_mutex_t lock = PTHREAD_MUTEX_INITIALIZER;
+    pthread_mutex_lock(&lock);
+    const char *rt = getenv("XDG_RUNTIME_DIR");
+    if (rt && *rt) {
+        char tmp[sizeof(status_path) + 8];
+        snprintf(status_path, sizeof(status_path), "%s/kettle-framegen", rt);
+        mkdir(status_path, 0700);
+        snprintf(status_path, sizeof(status_path), "%s/kettle-framegen/%d", rt, (int)getpid());
+        snprintf(tmp, sizeof(tmp), "%s.tmp", status_path);
+        FILE *f = fopen(tmp, "w");
+        if (f) {
+            fprintf(f, "multiplier=%d\n", __atomic_load_n(&status_mult, __ATOMIC_RELAXED));
+            if (fclose(f) || rename(tmp, status_path))
+                unlink(tmp);
+        }
+    }
+    pthread_mutex_unlock(&lock);
+}
+
+__attribute__((destructor)) static void status_remove(void)
+{
+    if (status_path[0])
+        unlink(status_path);
 }
 
 // Current settings; checks the file for changes at most twice a second.
@@ -1382,6 +1419,7 @@ static VkResult present_frames(VkQueue queue, const VkPresentInfoKHR *pi, struct
     struct config c = config_get();
     double now = now_s();
     int mult = c.multiplier ? c.multiplier : pace(sc, now, c.refresh > 0 ? c.refresh : display_refresh(sc, now));
+    status_write(mult);
     uint32_t family = queue_family(d, queue);
     if (mult < 2 || family >= d->nfamilies || !(d->families[family].queueFlags & VK_QUEUE_COMPUTE_BIT)) {
         sc->have_prev = sc->have_mv = false;

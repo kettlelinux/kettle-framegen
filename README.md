@@ -161,6 +161,11 @@ frame wasn't shown yet: near 0%, `low` changes nothing.
 
 The layer logs to stderr with the prefix `VK_LAYER_KETTLE_framegen:`.
 
+While a game runs, `$XDG_RUNTIME_DIR/kettle-framegen/<pid>` holds the multiplier in use as
+`multiplier=<n>` (the one `auto` picked, or the setting; `1` while generation is off), for tools
+that show it. The layer rewrites it when the multiplier changes and removes it when the game exits
+normally.
+
 ## License
 
 BSD 3-Clause, see [LICENSE](LICENSE).
