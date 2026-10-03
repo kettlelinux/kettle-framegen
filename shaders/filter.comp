@@ -43,7 +43,10 @@ void main()
                 best = i;
             }
         }
-        imageStore(dst, b, v[best]);
+        float region = v[0].z;  // the best match cost around: synth.comp falls back where it's poor
+        for (int i = 1; i < 9; i++)
+            region = min(region, v[i].z);
+        imageStore(dst, b, vec4(v[best].xy, v[4].z, region));
         if (v[4].z > BAD_COST)
             atomicAdd(cut.bad_blocks, 1u);
         ivec2 s = ivec2(round(v[best].xy * 16.0));
