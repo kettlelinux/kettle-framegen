@@ -72,8 +72,8 @@ static void check(const char *name, bool ok, const struct sim *s)
 
 int main(int argc, char **argv)
 {
-    if (!(argc > 1 && !strcmp(argv[1], "-v")))
-        freopen("/dev/null", "w", stderr);
+    if (!(argc > 1 && !strcmp(argv[1], "-v")) && !freopen("/dev/null", "w", stderr))
+        return 1;
     struct sim s;
 
     // 70 fps on 180 Hz needs 3x; 2x is tried now and then, ever less often
