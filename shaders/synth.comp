@@ -2,11 +2,16 @@
 // One generated frame at time t between the previous (0) and current (1) frame.
 // Each pixel follows a motion vector back into the previous frame and forward into the current
 // one and blends the two by t. The vector is picked per pixel: the block field interpolated
-// here, the four nearest block vectors, or zero, whichever makes the two frames agree best (with
-// a small bias to the interpolated one). That keeps motion edges sharp where interpolated
-// vectors would mix two motions, and static overlays (HUDs) still where their block moves.
-// Agreement is measured over the pixel and its left and right neighbours, so a single pixel
-// can't pick a vector its neighbourhood disagrees with (lone specks).
+// here, the four nearest block vectors, or zero (and, where zero nearly fits, the whole pixels
+// around it), whichever makes the two frames agree best (with a small bias to the interpolated
+// one). That keeps motion edges sharp where interpolated vectors would mix two motions, and
+// static overlays (HUDs) still where their block moves. Agreement is measured over the pixel
+// and the better of its left and right neighbours, so a single pixel can't pick a vector its
+// neighbourhood disagrees with (lone specks), while one at a figure's edge, whose neighbour
+// outside moves another way, can still pick the figure's.
+// Where two vectors fit, one from a figure in front and one from the background, the figure's
+// wins: the background's fits through a figure thinner than its motion (a sword), as both its
+// samples land on background beside it, and picking it would cut the figure out.
 // HUDs stay put over a moving scene: a pixel the same in both frames, with its left and right
 // neighbours, is still and kept as it is (any vector landing on flat HUD colour in both frames
 // would match it as well), and a moving vector whose sample lands on anything still
@@ -20,8 +25,11 @@
 // (games move the camera; the figures are what moves differently), and along it, one frame's
 // sample shows the figure. That one is told apart by following it with the figure's vector into
 // the other frame and finding it again there; the pixel comes from the other frame alone.
-// Where that doesn't settle it, it comes from the frame nearer in time. Where a vector leads
-// outside one frame (content coming into view at the screen edge), only the other frame is used.
+// Where that doesn't settle it, it comes from the frame nearer in time. And where the
+// background's vector fails and no figure's fits, but that test finds the figure, the pixel is
+// such background even if some other vector agrees, by chance (specks beside a thin figure).
+// Where a vector leads outside one frame (content coming into view at the screen edge), only
+// the other frame is used.
 // On a scene cut (filter.comp counts blocks no vector matched) the frame is the nearer real one,
 // and so, fading in, is any region whose blocks matched poorly (motion too fast or too small to
 // follow: a camera whipping round, a mouse cursor): a real frame shown again looks steadier
@@ -76,6 +84,11 @@ mediump float diff(mediump vec4 x, mediump vec4 y)
 
 mediump vec4 a, b;  // previous and current frame along the chosen vector
 mediump float best = 1e4;
+vec2 mean;                   // the frame's mean motion: the camera's
+mediump float figure = 1e4;  // the best match of a vector away from it: a figure's
+
+const mediump float FIGURE_MATCH = 0.2;  // a figure's vector matching better than this...
+const mediump float FIGURE_GAIN = 0.1;   // ...is preferred by up to this much
 
 // On or next to the HUD: filtered, the mask reaches a pixel past its edge
 bool on_hud(vec2 p)
@@ -83,57 +96,65 @@ bool on_hud(vec2 p)
     return textureLod(hud, p / pc.size, 0.0).r > 0.01;
 }
 
-void try_vector(vec2 q, vec2 v, mediump float bias)
+mediump float try_vector(vec2 q, vec2 v, mediump float bias)
 {
     vec2 qa = q - pc.t * v, qb = q + (1.0 - pc.t) * v;
     bool ina = inside(qa), inb = inside(qb);
     if (!ina && !inb)
-        return;
+        return 1e4;
     vec2 rcp = 1.0 / pc.size;
     mediump vec4 pa = textureLod(prev_img, qa * rcp, 0.0);
     mediump vec4 pb = textureLod(cur_img, qb * rcp, 0.0);
     mediump float c;
     if (ina && inb) {
         vec2 dx = vec2(1.0, 0.0);
-        c = diff(pa, pb) +
-            0.5 * diff(textureLod(prev_img, (qa - dx) * rcp, 0.0), textureLod(cur_img, (qb - dx) * rcp, 0.0)) +
-            0.5 * diff(textureLod(prev_img, (qa + dx) * rcp, 0.0), textureLod(cur_img, (qb + dx) * rcp, 0.0));
+        mediump float l = diff(textureLod(prev_img, (qa - dx) * rcp, 0.0), textureLod(cur_img, (qb - dx) * rcp, 0.0));
+        mediump float r = diff(textureLod(prev_img, (qa + dx) * rcp, 0.0), textureLod(cur_img, (qb + dx) * rcp, 0.0));
+        c = diff(pa, pb) + 2.0 * min(l, r);
         if (dot(v, v) > 2.25 && (on_hud(qa) || on_hud(qb)))
             c += 1.0;  // a moving vector on the HUD
     } else {
         // one side has left the frame: nothing to check against, so only take this
         // vector when nothing that can be checked fits, and never from the HUD
         if (dot(v, v) > 2.25 && on_hud(ina ? qa : qb))
-            return;
+            return 1e4;
         if (ina)
             pb = pa;
         else
             pa = pb;
         c = 0.3;
     }
+    // a figure's vector that matches is in front: prefer it to the background's, which matches
+    // too where it looks straight through a thin figure (a sword) at background on both sides
+    // (where it only matches as the colour around is flat, either is right)
+    if (ina && inb)
+        c -= FIGURE_GAIN * (1.0 - smoothstep(0.5 * FIGURE_MATCH, FIGURE_MATCH, c)) *
+             smoothstep(1.0, 4.0, distance(v, mean));
     c += bias;
+    if (distance(v, mean) > 2.0)
+        figure = min(figure, c);
     if (c < best) {
         best = c;
         a = pa;
         b = pb;
     }
+    return c;
 }
 
 // Where the pixel at q is background hidden in one frame by a figure in front: that frame's
 // sample along the background vector vb is the figure, which moving on with vf turns up again
-// in the other frame. Returns the other frame's sample, or `keep` when that doesn't settle it.
-mediump vec4 uncovered(vec2 q, vec2 vb, vec2 vf, mediump vec4 keep)
+// in the other frame. True when that settles it, with the other frame's sample in `shown`.
+bool uncovered(vec2 q, vec2 vb, vec2 vf, out mediump vec4 shown)
 {
     vec2 qa = q - pc.t * vb, qb = q + (1.0 - pc.t) * vb;
     if (!inside(qa) || !inside(qb))
-        return keep;
+        return false;
     vec2 rcp = 1.0 / pc.size;
     mediump vec4 pa = textureLod(prev_img, qa * rcp, 0.0), pb = textureLod(cur_img, qb * rcp, 0.0);
     bool a_hidden = inside(qa + vf) && diff(pa, textureLod(cur_img, (qa + vf) * rcp, 0.0)) < 0.12;
     bool b_hidden = inside(qb - vf) && diff(pb, textureLod(prev_img, (qb - vf) * rcp, 0.0)) < 0.12;
-    if (a_hidden == b_hidden)
-        return keep;
-    return a_hidden ? pb : pa;
+    shown = a_hidden ? pb : pa;
+    return a_hidden != b_hidden;
 }
 
 void main()
@@ -152,7 +173,9 @@ void main()
         imageStore(dst, p, uvec4(pack(pc.t < 0.5 ? textureLod(prev_img, uv, 0.0) : textureLod(cur_img, uv, 0.0))));
         return;
     }
+    mean = vec2(cut.sum) / (16.0 * float(grid.x * grid.y)) * pc.mv_to_px;
     vec2 cand[6];  // the block field here, the four nearest blocks, zero
+    mediump float cost[6];
     float matched = 1.0;  // the best match cost of the blocks around (filter.comp: 3x3 each)
     vec2 rcp = 1.0 / pc.size, dx = vec2(1.0, 0.0);
     mediump vec4 sa = textureLod(prev_img, q * rcp, 0.0), sb = textureLod(cur_img, q * rcp, 0.0);
@@ -173,25 +196,39 @@ void main()
         }
         cand[5] = vec2(0.0);
         for (int k = 0; k < 6; k++)
-            try_vector(q, cand[k], k == 0 ? 0.0 : k < 5 ? 0.04 : 0.08);
+            cost[k] = try_vector(q, cand[k], k == 0 ? 0.0 : k < 5 ? 0.04 : 0.08);
+        // something here nearly the same in both frames (zero nearly matches): a figure that
+        // the camera follows, swaying by a pixel, which no block's vector may follow when it's
+        // thin; whole pixels around zero find it
+        if (cost[5] < 1.0)
+            for (int k = 0; k < 9; k++)
+                if (k != 4)
+                    try_vector(q, vec2(k % 3 - 1, k / 3 - 1), 0.08);
     } else {
         try_vector(q, vec2(0.0), 0.0);
     }
     mediump vec3 d = abs(a.rgb - b.rgb);
     mediump float w = flow ? smoothstep(0.08, 0.25, max(d.r, max(d.g, d.b))) : 0.0;
     mediump vec4 alone = pc.t < 0.5 ? a : b;
-    if (w > 0.0) {
+    if (flow) {
         // background: the candidate nearest the mean motion; figure: the one farthest from it
-        vec2 mean = vec2(cut.sum) / (16.0 * float(grid.x * grid.y)) * pc.mv_to_px;
-        vec2 vb = cand[0], vf = cand[0];
+        int kb = 0;
         for (int k = 1; k < 6; k++)
-            if (distance(cand[k], mean) < distance(vb, mean))
-                vb = cand[k];
+            if (distance(cand[k], mean) < distance(cand[kb], mean))
+                kb = k;
+        vec2 vb = cand[kb], vf = cand[0];
         for (int k = 0; k < 6; k++)
             if (distance(cand[k], vb) > distance(vf, vb))
                 vf = cand[k];
-        if (distance(vf, vb) > 1.0)
-            alone = uncovered(q, vb, vf, alone);
+        // where the background's own vector fails, it is hidden in one frame, and when the
+        // figure is found there, what any vector matched instead was chance (specks beside
+        // thin figures): the frame showing the background is used
+        mediump float occ = smoothstep(0.5, 0.7, cost[kb]) * smoothstep(0.2, 0.4, figure);
+        mediump vec4 shown;
+        if ((w > 0.0 || occ > 0.0) && distance(vf, vb) > 1.0 && uncovered(q, vb, vf, shown)) {
+            alone = shown;
+            w = max(w, occ);
+        }
     }
     mediump vec4 c = mix(mix(a, b, pc.t), alone, w);
     if (flow) {
