@@ -40,6 +40,7 @@
 // GPU timestamps per present: start, then the end of each stage
 enum { TS_START, TS_PYRAMID, TS_MOTION, TS_SYNTH, TS_OUTPUT, NTS };
 #define ACQUIRE_TIMEOUT 100000000ull  // ns
+#define LATENCY_TIMEOUT 100000000ull  // ns: "latency = low" waits no longer for a frame to be shown
 #define PACE_TRY 10.0       // s: multiplier = auto tries one less this long after a change, and
                             // doesn't raise past a raise that showed no more frames for this long...
 #define PACE_TRY_MAX 300.0  // ...doubling after each failure, up to this
@@ -71,6 +72,7 @@ struct config {
     bool fifo;             // force FIFO presentation (read at swapchain creation)
     bool preserve_images;  // no extra swapchain images (read at swapchain creation)
     bool stats;            // log GPU time every 2 s
+    bool low_latency;      // "latency = low": hold the game until its previous frame is shown
     char dump[512];        // save the next generated frames here ("dump = <dir>", see dump())
     unsigned dump_serial;  // counts file loads that asked for a dump
 };
@@ -102,6 +104,8 @@ static void config_set(struct config *c, const char *k, const char *v)
         c->fifo = parse_bool(v);
     else if (!strcmp(k, "preserve_images"))
         c->preserve_images = parse_bool(v);
+    else if (!strcmp(k, "latency"))
+        c->low_latency = !strcasecmp(v, "low");
     else if (!strcmp(k, "stats"))
         c->stats = parse_bool(v);
     else if (!strcmp(k, "dump"))
@@ -141,7 +145,7 @@ static void config_load(void)
         }
         fclose(f);
     }
-    static const char *const keys[] = { "multiplier", "refresh", "flow_scale", "mode", "fifo", "preserve_images", "stats" };
+    static const char *const keys[] = { "multiplier", "refresh", "flow_scale", "mode", "fifo", "preserve_images", "stats", "latency" };
     for (size_t i = 0; i < sizeof(keys) / sizeof(*keys); i++) {
         char env[64];
         snprintf(env, sizeof(env), "KETTLE_FG_%s", keys[i]);
@@ -221,6 +225,8 @@ struct inst {
     PFN_vkGetPhysicalDeviceMemoryProperties GetPhysicalDeviceMemoryProperties;
     PFN_vkGetPhysicalDeviceProperties GetPhysicalDeviceProperties;
     PFN_vkGetPhysicalDeviceSurfaceCapabilitiesKHR GetPhysicalDeviceSurfaceCapabilitiesKHR;
+    PFN_vkEnumerateDeviceExtensionProperties EnumerateDeviceExtensionProperties;
+    PFN_vkGetPhysicalDeviceFeatures2 GetPhysicalDeviceFeatures2;
 };
 
 #define DEV_FUNCS(X)                                                                           \
@@ -266,6 +272,8 @@ struct dev {
     VkDescriptorSetLayout dsl[NPIPE];
     VkPipelineLayout layout[NPIPE];
     VkPipeline pipe[NPIPE];
+    // VK_KHR_present_wait (and the present_id it needs), for "latency = low" and its stats
+    PFN_vkWaitForPresentKHR WaitForPresentKHR;
 };
 
 struct img {
@@ -343,6 +351,11 @@ struct swapchain {
     VkBuffer cut;                // blocks no vector matched (filter.comp -> synth.comp)
     VkDeviceMemory cut_mem;
     struct pacing pace;
+    // Latency (present_wait): the id of the game's last presented frame and of the one before,
+    // and per stats period: presents, how many found the one before not yet shown, time waited
+    uint64_t present_id, prev_id;
+    uint32_t lat_n, lat_behind;
+    double lat_wait;
 };
 
 static pthread_mutex_t lock = PTHREAD_MUTEX_INITIALIZER;
@@ -1116,7 +1129,7 @@ out:
         d->FreeMemory(dev, mem, NULL);  // unmaps
 }
 
-static void stats(struct swapchain *sc, int slot, int multiplier)
+static void stats(struct swapchain *sc, int slot, int multiplier, bool low)
 {
     struct dev *d = sc->dev;
     uint64_t ts[NTS];
@@ -1139,6 +1152,13 @@ static void stats(struct swapchain *sc, int slot, int multiplier)
                 n / (t - sc->stat_t), sc->shown / (t - sc->stat_t), multiplier, sc->gpu_ms[0] / n,
                 sc->gpu_ms[TS_PYRAMID] / n, sc->gpu_ms[TS_MOTION] / n, sc->gpu_ms[TS_SYNTH] / n,
                 sc->gpu_ms[TS_OUTPUT] / n);
+        if (sc->lat_n)
+            say("latency: the previous frame wasn't shown yet at %.0f%% of presents%s", 100.0 * sc->lat_behind / sc->lat_n,
+                low ? "" : " (latency = low would hold the game there)");
+        if (low && sc->lat_n)
+            say("latency = low: waited %.2f ms per present", 1000.0 * sc->lat_wait / sc->lat_n);
+        sc->lat_n = sc->lat_behind = 0;
+        sc->lat_wait = 0;
         sc->stat_t = t;
         memset(sc->gpu_ms, 0, sizeof(sc->gpu_ms));
         sc->gpu_n = sc->shown = 0;
@@ -1265,6 +1285,49 @@ static VkResult present(struct swapchain *sc, VkQueue queue, const VkPresentInfo
     return r;
 }
 
+// The game's own frame. It goes out tagged with a present id (the game's, or the layer's when
+// the game gives none) so the layer can see it reach the screen. Generated frames between two
+// real ones need the later one rendered, so the game has to be a frame ahead of the display:
+// once this frame is queued, the previous one should be on screen. Where it isn't, the game is
+// further ahead and its frames wait in the queue, as latency; "latency = low" waits for it
+// here, which starts the game's next frame that much later and so that much closer to being
+// shown. Otherwise the layer only looks, for the stats.
+static VkResult present_game(struct swapchain *sc, VkQueue queue, const VkPresentInfoKHR *pi, bool low)
+{
+    struct dev *d = sc->dev;
+    if (!d->WaitForPresentKHR)
+        return present(sc, queue, pi);
+    const VkPresentIdKHR *gid = find_struct(pi->pNext, VK_STRUCTURE_TYPE_PRESENT_ID_KHR);
+    uint64_t id = gid && gid->swapchainCount && gid->pPresentIds ? gid->pPresentIds[0] : 0;
+    VkPresentInfoKHR tagged = *pi;
+    VkPresentIdKHR mine;
+    if (id > sc->present_id) {
+        sc->present_id = id;
+    } else if (!gid) {
+        id = ++sc->present_id;
+        mine = (VkPresentIdKHR){ VK_STRUCTURE_TYPE_PRESENT_ID_KHR, pi->pNext, 1, &id };
+        tagged.pNext = &mine;
+    } else {
+        id = 0;  // the game's struct without an id for this frame (or out of order): not followed
+    }
+    VkResult r = present(sc, queue, &tagged);
+    if (id && sc->prev_id) {
+        sc->lat_n++;
+        if (d->WaitForPresentKHR(d->handle, sc->handle, sc->prev_id, 0) == VK_TIMEOUT) {
+            sc->lat_behind++;
+            if (low) {
+                double t = now_s();
+                d->WaitForPresentKHR(d->handle, sc->handle, sc->prev_id, LATENCY_TIMEOUT);
+                sc->lat_wait += now_s() - t;
+                waited(sc, t);
+            }
+        }
+    }
+    if (id)
+        sc->prev_id = id;
+    return r;
+}
+
 static void present_image(struct swapchain *sc, VkQueue queue, uint32_t image, VkSemaphore wait)
 {
     VkPresentInfoKHR pi = {
@@ -1289,7 +1352,7 @@ static VkResult present_frames(VkQueue queue, const VkPresentInfoKHR *pi, struct
     uint32_t family = queue_family(d, queue);
     if (mult < 2 || family >= d->nfamilies || !(d->families[family].queueFlags & VK_QUEUE_COMPUTE_BIT)) {
         sc->have_prev = sc->have_mv = false;
-        return present(sc, queue, pi);
+        return present_game(sc, queue, pi, c.low_latency);
     }
     if (sc->ring_built && sc->family != family) {
         // presented from another queue family now (rare): start over there
@@ -1303,7 +1366,7 @@ static VkResult present_frames(VkQueue queue, const VkPresentInfoKHR *pi, struct
         say("couldn't create its resources, frame generation off for this swapchain");
         sc_free(sc);
         sc->broken = true;
-        return present(sc, queue, pi);
+        return present_game(sc, queue, pi, c.low_latency);
     }
 
     int slot = sc->count % RING;
@@ -1312,7 +1375,7 @@ static VkResult present_frames(VkQueue queue, const VkPresentInfoKHR *pi, struct
         d->WaitForFences(dev, 1, &f->fence, VK_TRUE, UINT64_MAX);
         f->pending = false;
         if (c.stats)
-            stats(sc, slot, mult);
+            stats(sc, slot, mult, c.low_latency);
     }
 
     // Allocated before any image is acquired, so failing here leaves nothing to hand back
@@ -1323,7 +1386,7 @@ static VkResult present_frames(VkQueue queue, const VkPresentInfoKHR *pi, struct
         free(waits);
         free(stages);
         sc->have_prev = sc->have_mv = false;
-        return present(sc, queue, pi);
+        return present_game(sc, queue, pi, c.low_latency);
     }
     d->ResetFences(dev, 1, &f->fence);
 
@@ -1389,7 +1452,7 @@ static VkResult present_frames(VkQueue queue, const VkPresentInfoKHR *pi, struct
         sc->have_prev = sc->have_mv = false;
         for (uint32_t k = 0; k < ngen; k++)
             present_image(sc, queue, acq[k], f->acquired[k]);
-        return present(sc, queue, pi);
+        return present_game(sc, queue, pi, c.low_latency);
     }
     f->pending = true;
     if (ngen && getenv("KETTLE_FG_DUMP")) {
@@ -1407,7 +1470,7 @@ static VkResult present_frames(VkQueue queue, const VkPresentInfoKHR *pi, struct
     VkPresentInfoKHR real = *pi;
     real.waitSemaphoreCount = 1;
     real.pWaitSemaphores = &sc->present_sems[idx];
-    r = present(sc, queue, &real);
+    r = present_game(sc, queue, &real, c.low_latency);
 
     sc->shown += ngen + 1;
     sc->count++;
@@ -1618,6 +1681,10 @@ static VKAPI_ATTR VkResult VKAPI_CALL CreateInstance(const VkInstanceCreateInfo 
     LOAD(GetPhysicalDeviceMemoryProperties);
     LOAD(GetPhysicalDeviceProperties);
     LOAD(GetPhysicalDeviceSurfaceCapabilitiesKHR);
+    LOAD(EnumerateDeviceExtensionProperties);
+    LOAD(GetPhysicalDeviceFeatures2);
+    if (!i->GetPhysicalDeviceFeatures2)
+        i->GetPhysicalDeviceFeatures2 = (PFN_vkGetPhysicalDeviceFeatures2)gipa(*out, "vkGetPhysicalDeviceFeatures2KHR");
 #undef LOAD
     pthread_mutex_lock(&lock);
     i->next = insts;
@@ -1635,6 +1702,78 @@ static VKAPI_ATTR void VKAPI_CALL DestroyInstance(VkInstance instance, const VkA
         i->DestroyInstance(instance, alloc);
         free(i);
     }
+}
+
+// Latency: VK_KHR_present_wait lets the layer see when the game's frames reach the screen
+// ("latency = low" holds the game until its previous one is shown). Where the device has it
+// (and VK_KHR_present_id, which it needs), it is enabled on the game's device, unless the game
+// turned either off. Returns the extension list to create the device with, or NULL to leave
+// the game's create info alone; ci2 and the feature structs are filled in to go with it.
+static const char **present_wait_enable(struct inst *i, VkPhysicalDevice phys, const VkDeviceCreateInfo *ci,
+                                         VkDeviceCreateInfo *ci2, VkPhysicalDevicePresentIdFeaturesKHR *pid,
+                                         VkPhysicalDevicePresentWaitFeaturesKHR *pw)
+{
+    if (!i->EnumerateDeviceExtensionProperties || !i->GetPhysicalDeviceFeatures2)
+        return NULL;
+    bool app_swapchain = false, app_id = false, app_wait = false;
+    for (uint32_t k = 0; k < ci->enabledExtensionCount; k++) {
+        const char *e = ci->ppEnabledExtensionNames[k];
+        app_swapchain |= !strcmp(e, VK_KHR_SWAPCHAIN_EXTENSION_NAME);
+        app_id |= !strcmp(e, VK_KHR_PRESENT_ID_EXTENSION_NAME);
+        app_wait |= !strcmp(e, VK_KHR_PRESENT_WAIT_EXTENSION_NAME);
+    }
+    const VkPhysicalDevicePresentIdFeaturesKHR *gid =
+        find_struct(ci->pNext, VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PRESENT_ID_FEATURES_KHR);
+    const VkPhysicalDevicePresentWaitFeaturesKHR *gw =
+        find_struct(ci->pNext, VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PRESENT_WAIT_FEATURES_KHR);
+    if (!app_swapchain || (gid && !gid->presentId) || (gw && !gw->presentWait))
+        return NULL;
+
+    uint32_t n = 0;
+    bool has_id = false, has_wait = false;
+    VkExtensionProperties *ext = NULL;
+    if (i->EnumerateDeviceExtensionProperties(phys, NULL, &n, NULL) == VK_SUCCESS && n &&
+        (ext = calloc(n, sizeof(*ext))) && i->EnumerateDeviceExtensionProperties(phys, NULL, &n, ext) >= 0)
+        for (uint32_t k = 0; k < n; k++) {
+            has_id |= !strcmp(ext[k].extensionName, VK_KHR_PRESENT_ID_EXTENSION_NAME);
+            has_wait |= !strcmp(ext[k].extensionName, VK_KHR_PRESENT_WAIT_EXTENSION_NAME);
+        }
+    free(ext);
+    VkPhysicalDevicePresentWaitFeaturesKHR qw = { .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PRESENT_WAIT_FEATURES_KHR };
+    VkPhysicalDevicePresentIdFeaturesKHR qi = { .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PRESENT_ID_FEATURES_KHR,
+                                                .pNext = &qw };
+    VkPhysicalDeviceFeatures2 f2 = { .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2, .pNext = &qi };
+    if (!has_id || !has_wait)
+        return NULL;
+    i->GetPhysicalDeviceFeatures2(phys, &f2);
+    if (!qi.presentId || !qw.presentWait)
+        return NULL;
+
+    const char **names = calloc(ci->enabledExtensionCount + 2, sizeof(*names));
+    if (!names)
+        return NULL;
+    uint32_t count = 0;
+    for (uint32_t k = 0; k < ci->enabledExtensionCount; k++)
+        names[count++] = ci->ppEnabledExtensionNames[k];
+    if (!app_id)
+        names[count++] = VK_KHR_PRESENT_ID_EXTENSION_NAME;
+    if (!app_wait)
+        names[count++] = VK_KHR_PRESENT_WAIT_EXTENSION_NAME;
+    *ci2 = *ci;
+    ci2->enabledExtensionCount = count;
+    ci2->ppEnabledExtensionNames = names;
+    // a game that names the extensions without their features gets them on (it didn't say off)
+    if (!gid) {
+        *pid = (VkPhysicalDevicePresentIdFeaturesKHR){ VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PRESENT_ID_FEATURES_KHR,
+                                                       (void *)ci2->pNext, VK_TRUE };
+        ci2->pNext = pid;
+    }
+    if (!gw) {
+        *pw = (VkPhysicalDevicePresentWaitFeaturesKHR){ VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PRESENT_WAIT_FEATURES_KHR,
+                                                        (void *)ci2->pNext, VK_TRUE };
+        ci2->pNext = pw;
+    }
+    return names;
 }
 
 static VKAPI_ATTR VkResult VKAPI_CALL CreateDevice(VkPhysicalDevice phys, const VkDeviceCreateInfo *ci,
@@ -1655,7 +1794,17 @@ static VKAPI_ATTR VkResult VKAPI_CALL CreateDevice(VkPhysicalDevice phys, const 
     link->u.pLayerInfo = link->u.pLayerInfo->pNext;
 
     PFN_vkCreateDevice create = (PFN_vkCreateDevice)gipa(i->handle, "vkCreateDevice");
-    VkResult r = create(phys, ci, alloc, out);
+    VkDeviceCreateInfo ci2;
+    VkPhysicalDevicePresentIdFeaturesKHR pid;
+    VkPhysicalDevicePresentWaitFeaturesKHR pw;
+    const char **names = present_wait_enable(i, phys, ci, &ci2, &pid, &pw);
+    VkResult r = VK_ERROR_INITIALIZATION_FAILED;
+    if (names)
+        r = create(phys, &ci2, alloc, out);
+    free(names);
+    bool present_wait = names && r == VK_SUCCESS;
+    if (!present_wait)  // without them (or as the game asked, when adding them failed)
+        r = create(phys, ci, alloc, out);
     if (r != VK_SUCCESS)
         return r;
 
@@ -1683,11 +1832,13 @@ static VKAPI_ATTR VkResult VKAPI_CALL CreateDevice(VkPhysicalDevice phys, const 
 #define X(n) d->n = (PFN_vk##n)gdpa(*out, "vk" #n);
     DEV_FUNCS(X)
 #undef X
+    if (present_wait)
+        d->WaitForPresentKHR = (PFN_vkWaitForPresentKHR)gdpa(*out, "vkWaitForPresentKHR");
     pthread_mutex_lock(&lock);
     d->next = devs;
     devs = d;
     pthread_mutex_unlock(&lock);
-    say("on %s", props.deviceName);
+    say("on %s%s", props.deviceName, d->WaitForPresentKHR ? "" : ", no present wait (latency = low off)");
     return VK_SUCCESS;
 }
 
