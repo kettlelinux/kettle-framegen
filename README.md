@@ -122,12 +122,13 @@ example `KETTLE_FG_MULTIPLIER=3`) overrides the file.
 | Key | Default | Meaning |
 | --- | --- | --- |
 | `multiplier` | `2` | Frames shown per rendered frame, 1 to 3, or `auto` (below). `1` turns generation off. |
-| `refresh` | measured | Display refresh rate in Hz, for `auto`. Set it: the measurement is a fallback. |
+| `refresh` | from the display | Display refresh rate in Hz, for `auto` (below). |
 | `mode` | `motion` | `blend` mixes frames without motion estimation. |
 | `flow_scale` | `0.5` | Resolution of the motion estimate as a fraction of the frame, 0.1 to 1. |
 | `fifo` | `true` | Force FIFO presentation, also for games that pick a present mode per frame (DXVK, vkd3d-proton). Read when the swapchain is created. |
 | `preserve_images` | `false` | Add no extra swapchain images. Read when the swapchain is created. |
 | `stats` | `false` | Log GPU time per stage every 2 seconds. |
+| `latency` | `normal` | `low` holds the game until its previous frame is on screen (below). |
 | `dump` | unset | Directory to save the next generated frames to, for debugging. |
 
 With FIFO, frames are shown evenly only when the game renders fast enough to fill every refresh
@@ -142,10 +143,21 @@ should show (the swapchain can run short of images) is undone and not retried fo
 doubling while it keeps failing. A game slower than refresh / 3 (60 fps on 180 Hz) can't fill
 every refresh even at 3x. The log shows each change.
 
-Set `refresh` for `auto`. Without it, the layer takes the display as full when the game waits
-for it and measures the refresh rate there, but a GPU-bound game also waits short of full, so
-`auto` can settle too low; with a frame limiter between the layer and the display, it measures
-the limit.
+Where the GPU's driver has `VK_EXT_present_timing` (RADV; Turnip from the Adreno 750 of the
+Snapdragon 8 Gen 3), the display tells `auto` its refresh rate and the log shows it. Elsewhere
+(Adreno 740 and older, PanVK) set `refresh`: without it, the layer takes the display as full
+when the game waits for it and measures the refresh rate there, but a GPU-bound game also waits
+short of full, so `auto` can settle too low; with a frame limiter between the layer and the
+display, it measures the limit. A `refresh` setting always wins.
+
+Generated frames between two real ones need the later one rendered, so the game always runs a
+frame ahead of the display. Any further and its frames wait in the swapchain's queue, which is
+input latency. With `latency = low`, after each of the game's frames the layer waits until the
+previous one is on screen, so the game starts its next frame that much later and closer to
+being shown. It needs `VK_KHR_present_wait` (RADV, Turnip and PanVK have it; the layer turns it
+on). Many games already keep their own queue short (vkd3d-proton and DXVK do), and at a full
+display the layer's own wait for spare images does too, so `stats` logs how often the previous
+frame wasn't shown yet: near 0%, `low` changes nothing.
 
 The layer logs to stderr with the prefix `VK_LAYER_KETTLE_framegen:`.
 

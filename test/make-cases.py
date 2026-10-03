@@ -79,6 +79,26 @@ def figure(bg_scene, fg_seed, x0, y0, rx, ry, vx, vy):
     return f
 
 
+def iso(l, r, b):
+    """A colour of luma l with the given red and blue: the motion search's luma can't tell it apart."""
+    return [r, (l - 0.2126 * r - 0.0722 * b) / 0.7152, b]
+
+
+def isoluminant(x0, y0, vx, vy):
+    """An object moving over a still background, both cells of random colours of the same luma."""
+    def cell(seed, x, y):
+        cx, cy = math.floor(x / 6), math.floor(y / 6)
+        return iso(0.5, 0.1 + 0.8 * hash01(seed, cx, cy, 1), 0.1 + 0.8 * hash01(seed, cx, cy, 2))
+
+    def f(x, y, t):
+        ox, oy = x - (x0 + vx * t), y - (y0 + vy * t)
+        if 0 <= ox < 56 and 0 <= oy < 40:
+            return cell(21, ox, oy)
+        return cell(22, x, y)
+
+    return f
+
+
 def hud(scene):
     def f(x, y, t):
         if 8 <= x < 104 and 116 <= y < 136:  # a status bar
@@ -148,6 +168,10 @@ CASES = {
     # chaotic enough that drivers disagree on many of them
     "pan-fast": (pan(2, 20, -6), 2, ["# chaotic vectors, see make-cases.py", "min_psnr = 25", "max_bad = 0.08"]),
     "pan-x3": (pan(3, 9, 3), 2, ["multiplier = 3"]),
+    # colour edges with no luma edge: the motion search must see colour
+    "isoluminant": (isoluminant(70, 50, 6, 3), 3, []),
+    # a slow pan between whole pixels: vectors need sub-pixel precision
+    "pan-subpixel": (pan(17, 2.6, 1.3), 3, ["multiplier = 3"]),
     "pan-full-scale": (pan(4, 6, 2), 2, ["flow_scale = 1.0"]),
     "blend": (pan(1, 6, 2), 2, ["mode = blend"]),
     "object": (obj(5, 6, 60, 40, 48, 10, 4), 3, []),

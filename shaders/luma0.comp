@@ -1,5 +1,7 @@
 // SPDX-License-Identifier: BSD-3-Clause
-// Level 0 of the luma pyramid: the presented frame's luma at the flow resolution.
+// Level 0 of the luma pyramid: the presented frame's luma at the flow resolution, with its
+// colour (blue and red difference from luma, around 0.5) in .g and .b: motion.comp weighs those
+// in too, so edges between colours of the same brightness don't look flat.
 // Four bilinear taps per output texel, so downscales to ~1/4 still average every source pixel.
 #version 450
 layout(local_size_x = 8, local_size_y = 8) in;
@@ -11,10 +13,11 @@ layout(push_constant) uniform PC {
     int bgr;  // the copied swapchain image is BGRA: its raw .r is blue
 } pc;
 
-float luma(vec4 c)
+vec3 ycc(vec4 c)
 {
     vec3 rgb = pc.bgr != 0 ? c.bgr : c.rgb;
-    return dot(rgb, vec3(0.2126, 0.7152, 0.0722));
+    float l = dot(rgb, vec3(0.2126, 0.7152, 0.0722));
+    return vec3(l, 0.5 + 0.5 * (rgb.b - l), 0.5 + 0.5 * (rgb.r - l));
 }
 
 void main()
@@ -26,9 +29,9 @@ void main()
     vec2 texel = 1.0 / vec2(size);
     vec2 uv = (vec2(p) + 0.5) * texel;
     vec2 o = 0.25 * texel;
-    float l = luma(textureLod(color, uv + vec2(-o.x, -o.y), 0.0)) +
-              luma(textureLod(color, uv + vec2( o.x, -o.y), 0.0)) +
-              luma(textureLod(color, uv + vec2(-o.x,  o.y), 0.0)) +
-              luma(textureLod(color, uv + vec2( o.x,  o.y), 0.0));
-    imageStore(dst, p, vec4(0.25 * l));
+    vec3 l = ycc(textureLod(color, uv + vec2(-o.x, -o.y), 0.0)) +
+             ycc(textureLod(color, uv + vec2( o.x, -o.y), 0.0)) +
+             ycc(textureLod(color, uv + vec2(-o.x,  o.y), 0.0)) +
+             ycc(textureLod(color, uv + vec2( o.x,  o.y), 0.0));
+    imageStore(dst, p, vec4(0.25 * l, 0.0));
 }

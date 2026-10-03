@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: BSD-3-Clause
-// Next luma pyramid level: 2x2 average of the level above (one bilinear tap between them).
+// Next luma pyramid level (luma and colour): 2x2 average of the level above (one bilinear tap
+// between them).
 #version 450
 layout(local_size_x = 8, local_size_y = 8) in;
 
@@ -17,5 +18,5 @@ void main()
     if (any(greaterThanEqual(p, size)))
         return;
     vec2 uv = (vec2(p) + 0.5) / vec2(size);
-    imageStore(dst, p, vec4(textureLod(pyramid, uv, float(pc.src_level)).r));
+    imageStore(dst, p, textureLod(pyramid, uv, float(pc.src_level)));
 }
