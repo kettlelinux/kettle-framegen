@@ -40,6 +40,9 @@
 // GPU timestamps per present: start, then the end of each stage
 enum { TS_START, TS_PYRAMID, TS_MOTION, TS_SYNTH, TS_OUTPUT, NTS };
 #define ACQUIRE_TIMEOUT 100000000ull  // ns
+#define PACE_TRY 10.0       // s: multiplier = auto tries one less this long after a change...
+#define PACE_TRY_MAX 300.0  // ...doubling after each try that didn't hold, up to this
+#define PACE_CAP 60.0       // s: a multiplier that showed no more frames than the one below isn't retried
 
 static void say(const char *fmt, ...)
 {
@@ -61,7 +64,8 @@ static double now_s(void)
 // ---------- settings ----------
 
 struct config {
-    int multiplier;        // frames shown per rendered one; 1 = off
+    int multiplier;        // frames shown per rendered one; 1 = off, 0 = auto (see pace())
+    float refresh;         // display refresh rate in Hz for auto; 0 = measure it
     float flow_scale;      // motion estimation resolution, fraction of the frame
     bool flow;             // false: plain blend without motion ("mode = blend")
     bool fifo;             // force FIFO presentation (read at swapchain creation)
@@ -87,7 +91,9 @@ static bool parse_bool(const char *v)
 static void config_set(struct config *c, const char *k, const char *v)
 {
     if (!strcmp(k, "multiplier"))
-        c->multiplier = atoi(v);
+        c->multiplier = !strcasecmp(v, "auto") ? 0 : atoi(v) < 1 ? 1 : atoi(v);
+    else if (!strcmp(k, "refresh"))
+        c->refresh = strtof(v, NULL);
     else if (!strcmp(k, "flow_scale"))
         c->flow_scale = strtof(v, NULL);
     else if (!strcmp(k, "mode"))
@@ -135,7 +141,7 @@ static void config_load(void)
         }
         fclose(f);
     }
-    static const char *const keys[] = { "multiplier", "flow_scale", "mode", "fifo", "preserve_images", "stats" };
+    static const char *const keys[] = { "multiplier", "refresh", "flow_scale", "mode", "fifo", "preserve_images", "stats" };
     for (size_t i = 0; i < sizeof(keys) / sizeof(*keys); i++) {
         char env[64];
         snprintf(env, sizeof(env), "KETTLE_FG_%s", keys[i]);
@@ -145,14 +151,14 @@ static void config_load(void)
         if (v && *v)
             config_set(&c, keys[i], v);
     }
-    if (c.multiplier < 1)
-        c.multiplier = 1;
     if (c.multiplier > MAX_GEN + 1)
         c.multiplier = MAX_GEN + 1;
     if (!(c.flow_scale >= 0.1f))  // NaN too
         c.flow_scale = 0.1f;
     if (c.flow_scale > 1.0f)
         c.flow_scale = 1.0f;
+    if (!(c.refresh > 0.0f))  // NaN too
+        c.refresh = 0.0f;
     if (c.dump[0])
         cfg_dump_serial++;
     c.dump_serial = cfg_dump_serial;
@@ -190,8 +196,11 @@ static struct config config_get(void)
         if (!stat(cfg_path, &st))
             cfg_mtime = st.st_mtim;
         config_load();
-        say("%s: %dx, %s, flow scale %.2f%s%s", cfg_path, cfg.multiplier, cfg.flow ? "motion" : "blend",
-            cfg.flow_scale, cfg.fifo ? ", fifo" : "", cfg.preserve_images ? ", preserve images" : "");
+        char mult[8] = "auto";
+        if (cfg.multiplier)
+            snprintf(mult, sizeof(mult), "%dx", cfg.multiplier);
+        say("%s: %s, %s, flow scale %.2f%s%s", cfg_path, mult, cfg.flow ? "motion" : "blend", cfg.flow_scale,
+            cfg.fifo ? ", fifo" : "", cfg.preserve_images ? ", preserve images" : "");
     }
     if (changed || t - cfg_checked >= 0.5)
         cfg_checked = t;
@@ -265,6 +274,22 @@ struct img {
     VkImageView view;
 };
 
+// multiplier = auto, per swapchain (see pace())
+struct pacing {
+    int n;                  // frames shown per rendered one; 0 until the first present
+    uint64_t waited_ns;     // display waits this window (atomic: the game may acquire on another thread)
+    double win_t;           // window start
+    uint32_t win_n, win_shown;  // presents and frames shown in it
+    bool settle;            // n just changed: the window mixes both, skip it
+    double hz_shown, hz_t;  // decayed sums over windows FIFO held back; their ratio is the refresh rate
+    double down_at, down_wait;  // next try at n - 1, and the wait after that
+    bool trying;            // n - 1 is being tried
+    double up_shown;        // after a raise: frames shown per second before it, else 0
+    int up_from, cap;       // ...and the multiplier before it; the highest allowed until cap_until
+    int up_short;           // windows since the raise that showed no more frames
+    double cap_until;
+};
+
 struct frame {  // one present in flight
     VkCommandBuffer cmd;
     VkFence fence;
@@ -317,6 +342,7 @@ struct swapchain {
     uint32_t gpu_n, shown;
     VkBuffer cut;                // blocks no vector matched (filter.comp -> synth.comp)
     VkDeviceMemory cut_mem;
+    struct pacing pace;
 };
 
 static pthread_mutex_t lock = PTHREAD_MUTEX_INITIALIZER;
@@ -1114,6 +1140,112 @@ static void stats(struct swapchain *sc, int slot, int multiplier)
     }
 }
 
+// multiplier = auto: the fewest frames per rendered one that fill every refresh. FIFO then shows
+// them evenly and holds the game at refresh / n. With too few, the display repeats some frames,
+// unevenly: judder at a frame rate that looks fine on paper.
+// Decided once a second from the window since the last decision. Where the game never waited for
+// the display, nothing held it back, so its present rate is its own and n = refresh / rate.
+// Where it did, its own rate is hidden: DXVK and vkd3d-proton present from a thread of their
+// own, so the time the game spends elsewhere doesn't show. There n - 1 is tried now and then and
+// kept if the game still waits for the display; each failed try doubles the wait for the next.
+// With a refresh rate set, the display is full when nearly every refresh shows a frame. Without,
+// the refresh rate is the rate frames are shown at while the game waits for the display, and
+// the display is full when the game waits for it, which a GPU-bound game also does short of
+// full (the compositor hands images back only once the GPU is done with them).
+// A raise that shows no more frames than before only costs rendered ones (4x can run out of
+// swapchain images to queue its frames in), so it is undone and not repeated for a while.
+static int pace(struct swapchain *sc, double t, float refresh)
+{
+    struct pacing *p = &sc->pace;
+    if (!p->n) {
+        p->n = 2;
+        p->win_t = t;
+        p->down_wait = PACE_TRY;
+        p->down_at = t + p->down_wait;
+    }
+    double dt = t - p->win_t;
+    if (dt < 1.0) {
+        p->win_n++;
+        return p->n;
+    }
+    double waited = __atomic_exchange_n(&p->waited_ns, 0, __ATOMIC_RELAXED) * 1e-9;
+    double fps = p->win_n / dt, shown = p->win_shown / dt;
+    if (waited > 0.1 * dt && dt < 1.5) {
+        p->hz_shown = 0.9 * p->hz_shown + p->win_shown;
+        p->hz_t = 0.9 * p->hz_t + dt;
+    }
+    double hz = refresh > 0 ? refresh : p->hz_t >= 3.0 ? p->hz_shown / p->hz_t : 0.0;
+    bool held = refresh > 0 ? shown >= 0.95 * refresh : waited > 0.02 * dt;
+    int n = p->n, top = t < p->cap_until ? p->cap : MAX_GEN + 1;
+    bool judged = !p->settle && dt < 1.5;
+    bool short_of = p->up_shown > 0 && shown < 1.03 * p->up_shown;
+    p->settle = false;
+    if (!judged) {
+        // n just changed, so the window shows neither, or the game stalled (loading, hidden)
+    } else if (short_of && ++p->up_short < 2) {
+        // the queue may still be filling after the raise: judge the next window too
+    } else if (short_of) {
+        say("auto multiplier %dx shows no more frames than %dx (%.1f per second)", n, p->up_from, shown);
+        n = p->cap = p->up_from;
+        p->cap_until = t + PACE_CAP;
+        p->up_shown = 0;
+        p->trying = false;
+    } else if (held) {
+        if (p->trying) {
+            say("auto multiplier %dx holds", n);
+            p->trying = false;
+            p->down_wait = PACE_TRY;
+        }
+        if (n > 1 && t >= p->down_at) {
+            n--;
+            p->trying = true;
+        }
+    } else {
+        if (p->trying) {
+            p->trying = false;
+            p->down_wait = fmin(2.0 * p->down_wait, PACE_TRY_MAX);
+        }
+        // a little short of the refresh rate is close enough to fill it
+        int want = hz > 0 ? (int)ceil(hz / fps - 0.03) : n + 1;
+        if (want > n && n < top) {
+            p->up_shown = shown;
+            p->up_from = n;
+            p->up_short = 0;
+            n = want < top ? want : top;
+        }
+    }
+    if (judged && n == p->n && !(short_of && p->up_short < 2))
+        p->up_shown = 0;  // the raise was judged (or there was none)
+    if (n != p->n) {
+        char rate[16] = "unknown";
+        if (hz > 0)
+            snprintf(rate, sizeof(rate), "%.1f Hz", hz);
+        say("auto multiplier %dx%s: %.1f rendered fps, %s display", n, p->trying ? " (trying)" : "", fps, rate);
+        p->n = n;
+        p->settle = true;
+        p->down_at = t + p->down_wait;
+    }
+    p->win_t = t;
+    p->win_n = 1;
+    p->win_shown = 0;
+    return p->n;
+}
+
+// Counts time the game spent waiting for the display, for pace()
+static void waited(struct swapchain *sc, double since)
+{
+    __atomic_fetch_add(&sc->pace.waited_ns, (uint64_t)((now_s() - since) * 1e9), __ATOMIC_RELAXED);
+}
+
+static VkResult present(struct swapchain *sc, VkQueue queue, const VkPresentInfoKHR *pi)
+{
+    double t = now_s();
+    VkResult r = sc->dev->QueuePresentKHR(queue, pi);
+    waited(sc, t);
+    sc->pace.win_shown++;
+    return r;
+}
+
 static void present_image(struct swapchain *sc, VkQueue queue, uint32_t image, VkSemaphore wait)
 {
     VkPresentInfoKHR pi = {
@@ -1124,7 +1256,7 @@ static void present_image(struct swapchain *sc, VkQueue queue, uint32_t image, V
         .pSwapchains = &sc->handle,
         .pImageIndices = &image,
     };
-    sc->dev->QueuePresentKHR(queue, &pi);
+    present(sc, queue, &pi);
 }
 
 static VkResult present_frames(VkQueue queue, const VkPresentInfoKHR *pi, struct swapchain *sc)
@@ -1134,10 +1266,11 @@ static VkResult present_frames(VkQueue queue, const VkPresentInfoKHR *pi, struct
         return d->QueuePresentKHR(queue, pi);
     VkDevice dev = d->handle;
     struct config c = config_get();
+    int mult = c.multiplier ? c.multiplier : pace(sc, now_s(), c.refresh);
     uint32_t family = queue_family(d, queue);
-    if (c.multiplier < 2 || family >= d->nfamilies || !(d->families[family].queueFlags & VK_QUEUE_COMPUTE_BIT)) {
+    if (mult < 2 || family >= d->nfamilies || !(d->families[family].queueFlags & VK_QUEUE_COMPUTE_BIT)) {
         sc->have_prev = sc->have_mv = false;
-        return d->QueuePresentKHR(queue, pi);
+        return present(sc, queue, pi);
     }
     if (sc->ring_built && sc->family != family) {
         // presented from another queue family now (rare): start over there
@@ -1151,7 +1284,7 @@ static VkResult present_frames(VkQueue queue, const VkPresentInfoKHR *pi, struct
         say("couldn't create its resources, frame generation off for this swapchain");
         sc_free(sc);
         sc->broken = true;
-        return d->QueuePresentKHR(queue, pi);
+        return present(sc, queue, pi);
     }
 
     int slot = sc->count % RING;
@@ -1160,7 +1293,7 @@ static VkResult present_frames(VkQueue queue, const VkPresentInfoKHR *pi, struct
         d->WaitForFences(dev, 1, &f->fence, VK_TRUE, UINT64_MAX);
         f->pending = false;
         if (c.stats)
-            stats(sc, slot, c.multiplier);
+            stats(sc, slot, mult);
     }
 
     // Allocated before any image is acquired, so failing here leaves nothing to hand back
@@ -1171,19 +1304,21 @@ static VkResult present_frames(VkQueue queue, const VkPresentInfoKHR *pi, struct
         free(waits);
         free(stages);
         sc->have_prev = sc->have_mv = false;
-        return d->QueuePresentKHR(queue, pi);
+        return present(sc, queue, pi);
     }
     d->ResetFences(dev, 1, &f->fence);
 
     // Spare images for the generated frames. Waiting here is FIFO pacing at work; a timeout
     // means the images ran out (preserve_images) or presentation stalled (hidden window).
     uint32_t idx = pi->pImageIndices[0], acq[MAX_GEN], ngen = 0;
-    while (sc->have_prev && ngen < (uint32_t)c.multiplier - 1) {
+    while (sc->have_prev && ngen < (uint32_t)mult - 1) {
         bool probe = ngen >= sc->gen_limit;
         if (probe && now_s() < sc->probe_at)
             break;
+        double t = now_s();
         VkResult r = d->AcquireNextImageKHR(dev, sc->handle, probe ? 0 : ACQUIRE_TIMEOUT, f->acquired[ngen],
                                             VK_NULL_HANDLE, &acq[ngen]);
+        waited(sc, t);
         if (r == VK_TIMEOUT || r == VK_NOT_READY) {
             if (!probe) {
                 say("no spare swapchain image after %u generated frames, generating at most that many", ngen);
@@ -1200,7 +1335,7 @@ static VkResult present_frames(VkQueue queue, const VkPresentInfoKHR *pi, struct
     }
 
     bool fresh = sc->fresh;
-    record(sc, f->cmd, slot, idx, acq, ngen, c.multiplier, c.flow);
+    record(sc, f->cmd, slot, idx, acq, ngen, mult, c.flow);
 
     // The game's wait semaphores gate our copy of its frame; its present then waits for us.
     uint32_t nwait = pi->waitSemaphoreCount + ngen;
@@ -1235,7 +1370,7 @@ static VkResult present_frames(VkQueue queue, const VkPresentInfoKHR *pi, struct
         sc->have_prev = sc->have_mv = false;
         for (uint32_t k = 0; k < ngen; k++)
             present_image(sc, queue, acq[k], f->acquired[k]);
-        return d->QueuePresentKHR(queue, pi);
+        return present(sc, queue, pi);
     }
     f->pending = true;
     if (ngen && getenv("KETTLE_FG_DUMP")) {
@@ -1253,7 +1388,7 @@ static VkResult present_frames(VkQueue queue, const VkPresentInfoKHR *pi, struct
     VkPresentInfoKHR real = *pi;
     real.waitSemaphoreCount = 1;
     real.pWaitSemaphores = &sc->present_sems[idx];
-    r = d->QueuePresentKHR(queue, &real);
+    r = present(sc, queue, &real);
 
     sc->shown += ngen + 1;
     sc->count++;
@@ -1382,6 +1517,13 @@ static VKAPI_ATTR VkResult VKAPI_CALL CreateSwapchainKHR(VkDevice device, const 
         sc->dump_serial = c.dump_serial;  // only requests made after it exists
         sc->bgr = bgr;
         sc->fifo = c.fifo;
+        // a recreated swapchain (resize, mode change) keeps what auto pacing has learned
+        struct swapchain *old = ci->oldSwapchain ? find_sc(ci->oldSwapchain, false) : NULL;
+        if (old && old->pace.n) {
+            sc->pace = old->pace;
+            sc->pace.waited_ns = 0;
+            sc->pace.settle = true;
+        }
         pthread_mutex_lock(&lock);
         sc->next = swapchains;
         swapchains = sc;
@@ -1409,6 +1551,19 @@ static VKAPI_ATTR void VKAPI_CALL DestroySwapchainKHR(VkDevice device, VkSwapcha
         free(sc);
     }
     d->DestroySwapchainKHR(device, swapchain, alloc);
+}
+
+// The game's own acquires: where it waits for the display when the layer generates nothing
+static VKAPI_ATTR VkResult VKAPI_CALL AcquireNextImageKHR(VkDevice device, VkSwapchainKHR swapchain, uint64_t timeout,
+                                                          VkSemaphore semaphore, VkFence fence, uint32_t *index)
+{
+    struct dev *d = find_dev(KEY(device));
+    struct swapchain *sc = find_sc(swapchain, false);
+    double t = now_s();
+    VkResult r = d->AcquireNextImageKHR(device, swapchain, timeout, semaphore, fence, index);
+    if (sc)
+        waited(sc, t);
+    return r;
 }
 
 // ---------- instance, device, queues ----------
@@ -1601,6 +1756,7 @@ static PFN_vkVoidFunction intercept(const char *name)
         { "vkGetDeviceQueue2", (PFN_vkVoidFunction)GetDeviceQueue2 },
         { "vkCreateSwapchainKHR", (PFN_vkVoidFunction)CreateSwapchainKHR },
         { "vkDestroySwapchainKHR", (PFN_vkVoidFunction)DestroySwapchainKHR },
+        { "vkAcquireNextImageKHR", (PFN_vkVoidFunction)AcquireNextImageKHR },
         { "vkQueuePresentKHR", (PFN_vkVoidFunction)QueuePresentKHR },
     };
     for (size_t i = 0; i < sizeof(funcs) / sizeof(*funcs); i++)

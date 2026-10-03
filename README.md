@@ -110,13 +110,30 @@ example `KETTLE_FG_MULTIPLIER=3`) overrides the file.
 
 | Key | Default | Meaning |
 | --- | --- | --- |
-| `multiplier` | `2` | Frames shown per rendered frame, 1 to 4. `1` turns generation off. |
+| `multiplier` | `2` | Frames shown per rendered frame, 1 to 4, or `auto` (below). `1` turns generation off. |
+| `refresh` | measured | Display refresh rate in Hz, for `auto`. Set it: the measurement is a fallback. |
 | `mode` | `motion` | `blend` mixes frames without motion estimation. |
 | `flow_scale` | `0.5` | Resolution of the motion estimate as a fraction of the frame, 0.1 to 1. |
 | `fifo` | `true` | Force FIFO presentation, also for games that pick a present mode per frame (DXVK, vkd3d-proton). Read when the swapchain is created. |
 | `preserve_images` | `false` | Add no extra swapchain images. Read when the swapchain is created. |
 | `stats` | `false` | Log GPU time per stage every 2 seconds. |
 | `dump` | unset | Directory to save the next generated frames to, for debugging. |
+
+With FIFO, frames are shown evenly only when the game renders fast enough to fill every refresh
+with the multiplier: a 45 fps game at 2x on a 120 Hz display shows each generated frame for one
+refresh and each rendered one for nearly two, which judders. `multiplier = auto` picks the
+fewest frames per rendered one that fill every refresh (4x at 45 fps on 180 Hz), and FIFO then
+holds the game at refresh / multiplier (45 fps here). Whether the game could fill it with one
+less doesn't show while it is held, so the layer tries one less now and then: it keeps it if
+the display still fills, and otherwise goes back (a second or two of judder) and doubles the
+wait before the next try, up to 5 minutes. A raise that shows no more frames than before (4x
+can run short of swapchain images) is undone and not retried for a minute. The log shows each
+change.
+
+Set `refresh` for `auto`. Without it, the layer takes the display as full when the game waits
+for it and measures the refresh rate there, but a GPU-bound game also waits short of full, so
+`auto` can settle too low; with a frame limiter between the layer and the display, it measures
+the limit.
 
 The layer logs to stderr with the prefix `VK_LAYER_KETTLE_framegen:`.
 
