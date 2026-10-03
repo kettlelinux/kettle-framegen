@@ -227,6 +227,7 @@ struct inst {
     PFN_vkGetPhysicalDeviceSurfaceCapabilitiesKHR GetPhysicalDeviceSurfaceCapabilitiesKHR;
     PFN_vkEnumerateDeviceExtensionProperties EnumerateDeviceExtensionProperties;
     PFN_vkGetPhysicalDeviceFeatures2 GetPhysicalDeviceFeatures2;
+    bool surface_caps2;  // VK_KHR_get_surface_capabilities2 is on (VK_EXT_present_timing needs it)
 };
 
 #define DEV_FUNCS(X)                                                                           \
@@ -274,6 +275,9 @@ struct dev {
     VkPipeline pipe[NPIPE];
     // VK_KHR_present_wait (and the present_id it needs), for "latency = low" and its stats
     PFN_vkWaitForPresentKHR WaitForPresentKHR;
+#ifdef VK_EXT_present_timing
+    PFN_vkGetSwapchainTimingPropertiesEXT GetSwapchainTimingPropertiesEXT;  // the refresh rate
+#endif
 };
 
 struct img {
@@ -356,6 +360,9 @@ struct swapchain {
     uint64_t present_id, prev_id;
     uint32_t lat_n, lat_behind;
     double lat_wait;
+    bool timing;            // created for VK_EXT_present_timing: the display tells its refresh rate
+    float timing_hz;        // ...which it last told, 0 until it does
+    double timing_at;       // when to ask again
 };
 
 static pthread_mutex_t lock = PTHREAD_MUTEX_INITIALIZER;
@@ -1165,6 +1172,31 @@ static void stats(struct swapchain *sc, int slot, int multiplier, bool low)
     }
 }
 
+// The display's refresh rate from VK_EXT_present_timing, asked at most once a second (it changes
+// with the display mode); 0 until the display tells or where the device can't.
+static float display_refresh(struct swapchain *sc, double t)
+{
+#ifdef VK_EXT_present_timing
+    struct dev *d = sc->dev;
+    if (sc->timing && t >= sc->timing_at) {
+        sc->timing_at = t + 1.0;
+        VkSwapchainTimingPropertiesEXT tp = { .sType = VK_STRUCTURE_TYPE_SWAPCHAIN_TIMING_PROPERTIES_EXT };
+        if (d->GetSwapchainTimingPropertiesEXT(d->handle, sc->handle, &tp, NULL) == VK_SUCCESS &&
+            tp.refreshDuration) {
+            float hz = 1e9f / (float)tp.refreshDuration;
+            if (fabsf(hz - sc->timing_hz) > 0.5f)
+                say("display refresh rate %.2f Hz (present timing)", hz);
+            sc->timing_hz = hz;
+        }
+    }
+    return sc->timing_hz;
+#else
+    (void)sc;
+    (void)t;
+    return 0.0f;
+#endif
+}
+
 // multiplier = auto: the fewest frames per rendered one that fill every refresh. FIFO then shows
 // them evenly and holds the game at refresh / n. With too few, the display repeats some frames,
 // unevenly: judder at a frame rate that looks fine on paper.
@@ -1348,7 +1380,8 @@ static VkResult present_frames(VkQueue queue, const VkPresentInfoKHR *pi, struct
         return d->QueuePresentKHR(queue, pi);
     VkDevice dev = d->handle;
     struct config c = config_get();
-    int mult = c.multiplier ? c.multiplier : pace(sc, now_s(), c.refresh);
+    double now = now_s();
+    int mult = c.multiplier ? c.multiplier : pace(sc, now, c.refresh > 0 ? c.refresh : display_refresh(sc, now));
     uint32_t family = queue_family(d, queue);
     if (mult < 2 || family >= d->nfamilies || !(d->families[family].queueFlags & VK_QUEUE_COMPUTE_BIT)) {
         sc->have_prev = sc->have_mv = false;
@@ -1578,7 +1611,21 @@ static VKAPI_ATTR VkResult VKAPI_CALL CreateSwapchainKHR(VkDevice device, const 
         modes->presentModeCount = 1;
         modes->pPresentModes = &fifo;
     }
+    bool timing = false;
+#ifdef VK_EXT_present_timing
+    if (d->GetSwapchainTimingPropertiesEXT) {
+        ci2.flags |= VK_SWAPCHAIN_CREATE_PRESENT_TIMING_BIT_EXT;  // for the refresh rate
+        timing = true;
+    }
+#endif
     VkResult r = d->CreateSwapchainKHR(device, &ci2, alloc, out);
+#ifdef VK_EXT_present_timing
+    if (r != VK_SUCCESS && timing) {  // as the game asked, then
+        ci2.flags &= ~VK_SWAPCHAIN_CREATE_PRESENT_TIMING_BIT_EXT;
+        timing = false;
+        r = d->CreateSwapchainKHR(device, &ci2, alloc, out);
+    }
+#endif
     if (modes) {
         modes->presentModeCount = nmodes;
         modes->pPresentModes = asked;
@@ -1599,6 +1646,7 @@ static VKAPI_ATTR VkResult VKAPI_CALL CreateSwapchainKHR(VkDevice device, const 
         sc->dump_serial = c.dump_serial;  // only requests made after it exists
         sc->bgr = bgr;
         sc->fifo = c.fifo;
+        sc->timing = timing;
         // a recreated swapchain (resize, mode change) keeps what auto pacing has learned
         struct swapchain *old = ci->oldSwapchain ? find_sc(ci->oldSwapchain, false) : NULL;
         if (old && old->pace.n) {
@@ -1663,7 +1711,26 @@ static VKAPI_ATTR VkResult VKAPI_CALL CreateInstance(const VkInstanceCreateInfo 
     link->u.pLayerInfo = link->u.pLayerInfo->pNext;
 
     PFN_vkCreateInstance create = (PFN_vkCreateInstance)gipa(NULL, "vkCreateInstance");
-    VkResult r = create(ci, alloc, out);
+    // VK_EXT_present_timing (the display's refresh rate, for multiplier = auto) needs
+    // VK_KHR_get_surface_capabilities2 on the instance: added where the game didn't, and left
+    // out again if the instance can't have it
+    bool caps2 = false;
+    for (uint32_t k = 0; k < ci->enabledExtensionCount; k++)
+        caps2 |= !strcmp(ci->ppEnabledExtensionNames[k], VK_KHR_GET_SURFACE_CAPABILITIES_2_EXTENSION_NAME);
+    VkResult r = VK_ERROR_EXTENSION_NOT_PRESENT;
+    const char **names = caps2 ? NULL : calloc(ci->enabledExtensionCount + 1, sizeof(*names));
+    if (names) {
+        VkInstanceCreateInfo ci2 = *ci;
+        memcpy(names, ci->ppEnabledExtensionNames, ci->enabledExtensionCount * sizeof(*names));
+        names[ci->enabledExtensionCount] = VK_KHR_GET_SURFACE_CAPABILITIES_2_EXTENSION_NAME;
+        ci2.enabledExtensionCount++;
+        ci2.ppEnabledExtensionNames = names;
+        r = create(&ci2, alloc, out);
+        free(names);
+        caps2 = r == VK_SUCCESS;
+    }
+    if (!caps2 || !names)
+        r = create(ci, alloc, out);
     if (r != VK_SUCCESS)
         return r;
 
@@ -1675,6 +1742,7 @@ static VKAPI_ATTR VkResult VKAPI_CALL CreateInstance(const VkInstanceCreateInfo 
     i->key = KEY(*out);
     i->handle = *out;
     i->gipa = gipa;
+    i->surface_caps2 = caps2;
 #define LOAD(n) i->n = (PFN_vk##n)gipa(*out, "vk" #n)
     LOAD(DestroyInstance);
     LOAD(GetPhysicalDeviceQueueFamilyProperties);
@@ -1709,19 +1777,44 @@ static VKAPI_ATTR void VKAPI_CALL DestroyInstance(VkInstance instance, const VkA
 // (and VK_KHR_present_id, which it needs), it is enabled on the game's device, unless the game
 // turned either off. Returns the extension list to create the device with, or NULL to leave
 // the game's create info alone; ci2 and the feature structs are filled in to go with it.
-static const char **present_wait_enable(struct inst *i, VkPhysicalDevice phys, const VkDeviceCreateInfo *ci,
-                                         VkDeviceCreateInfo *ci2, VkPhysicalDevicePresentIdFeaturesKHR *pid,
-                                         VkPhysicalDevicePresentWaitFeaturesKHR *pw)
+// With them, where the device and instance allow, VK_EXT_present_timing (and VK_KHR_present_id2
+// and VK_KHR_calibrated_timestamps, which it needs): it tells the display's refresh rate, for
+// multiplier = auto. *timing says whether it was added.
+struct device_extras {
+    VkPhysicalDevicePresentIdFeaturesKHR id;
+    VkPhysicalDevicePresentWaitFeaturesKHR wait;
+#ifdef VK_EXT_present_timing
+    VkPhysicalDevicePresentId2FeaturesKHR id2;
+    VkPhysicalDevicePresentTimingFeaturesEXT timing;
+#endif
+};
+
+static bool has_ext(const VkExtensionProperties *ext, uint32_t n, const char *name)
 {
+    for (uint32_t k = 0; k < n; k++)
+        if (!strcmp(ext[k].extensionName, name))
+            return true;
+    return false;
+}
+
+static bool names_ext(const char *const *names, uint32_t n, const char *name)
+{
+    for (uint32_t k = 0; k < n; k++)
+        if (!strcmp(names[k], name))
+            return true;
+    return false;
+}
+
+static const char **present_wait_enable(struct inst *i, VkPhysicalDevice phys, const VkDeviceCreateInfo *ci,
+                                         VkDeviceCreateInfo *ci2, struct device_extras *x, bool *timing)
+{
+    *timing = false;
     if (!i->EnumerateDeviceExtensionProperties || !i->GetPhysicalDeviceFeatures2)
         return NULL;
-    bool app_swapchain = false, app_id = false, app_wait = false;
-    for (uint32_t k = 0; k < ci->enabledExtensionCount; k++) {
-        const char *e = ci->ppEnabledExtensionNames[k];
-        app_swapchain |= !strcmp(e, VK_KHR_SWAPCHAIN_EXTENSION_NAME);
-        app_id |= !strcmp(e, VK_KHR_PRESENT_ID_EXTENSION_NAME);
-        app_wait |= !strcmp(e, VK_KHR_PRESENT_WAIT_EXTENSION_NAME);
-    }
+    const char *const *app = ci->ppEnabledExtensionNames;
+    bool app_swapchain = names_ext(app, ci->enabledExtensionCount, VK_KHR_SWAPCHAIN_EXTENSION_NAME);
+    bool app_id = names_ext(app, ci->enabledExtensionCount, VK_KHR_PRESENT_ID_EXTENSION_NAME);
+    bool app_wait = names_ext(app, ci->enabledExtensionCount, VK_KHR_PRESENT_WAIT_EXTENSION_NAME);
     const VkPhysicalDevicePresentIdFeaturesKHR *gid =
         find_struct(ci->pNext, VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PRESENT_ID_FEATURES_KHR);
     const VkPhysicalDevicePresentWaitFeaturesKHR *gw =
@@ -1730,26 +1823,47 @@ static const char **present_wait_enable(struct inst *i, VkPhysicalDevice phys, c
         return NULL;
 
     uint32_t n = 0;
-    bool has_id = false, has_wait = false;
     VkExtensionProperties *ext = NULL;
-    if (i->EnumerateDeviceExtensionProperties(phys, NULL, &n, NULL) == VK_SUCCESS && n &&
-        (ext = calloc(n, sizeof(*ext))) && i->EnumerateDeviceExtensionProperties(phys, NULL, &n, ext) >= 0)
-        for (uint32_t k = 0; k < n; k++) {
-            has_id |= !strcmp(ext[k].extensionName, VK_KHR_PRESENT_ID_EXTENSION_NAME);
-            has_wait |= !strcmp(ext[k].extensionName, VK_KHR_PRESENT_WAIT_EXTENSION_NAME);
-        }
+    if (i->EnumerateDeviceExtensionProperties(phys, NULL, &n, NULL) != VK_SUCCESS || !n ||
+        !(ext = calloc(n, sizeof(*ext))) || i->EnumerateDeviceExtensionProperties(phys, NULL, &n, ext) < 0) {
+        free(ext);
+        return NULL;
+    }
+    bool has_id = has_ext(ext, n, VK_KHR_PRESENT_ID_EXTENSION_NAME);
+    bool has_wait = has_ext(ext, n, VK_KHR_PRESENT_WAIT_EXTENSION_NAME);
+#ifdef VK_EXT_present_timing
+    bool has_timing = i->surface_caps2 && has_ext(ext, n, VK_EXT_PRESENT_TIMING_EXTENSION_NAME) &&
+                      has_ext(ext, n, VK_KHR_PRESENT_ID_2_EXTENSION_NAME) &&
+                      has_ext(ext, n, VK_KHR_CALIBRATED_TIMESTAMPS_EXTENSION_NAME);
+    // the game's own say on them: none, or on
+    const VkPhysicalDevicePresentId2FeaturesKHR *gid2 =
+        find_struct(ci->pNext, VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PRESENT_ID_2_FEATURES_KHR);
+    const VkPhysicalDevicePresentTimingFeaturesEXT *gt =
+        find_struct(ci->pNext, VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PRESENT_TIMING_FEATURES_EXT);
+    has_timing = has_timing && !(gid2 && !gid2->presentId2) && !(gt && !gt->presentTiming);
+    VkPhysicalDevicePresentTimingFeaturesEXT qt = { .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PRESENT_TIMING_FEATURES_EXT };
+    VkPhysicalDevicePresentId2FeaturesKHR qi2 = { .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PRESENT_ID_2_FEATURES_KHR,
+                                                  .pNext = &qt };
+#endif
     free(ext);
     VkPhysicalDevicePresentWaitFeaturesKHR qw = { .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PRESENT_WAIT_FEATURES_KHR };
     VkPhysicalDevicePresentIdFeaturesKHR qi = { .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PRESENT_ID_FEATURES_KHR,
                                                 .pNext = &qw };
     VkPhysicalDeviceFeatures2 f2 = { .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2, .pNext = &qi };
+#ifdef VK_EXT_present_timing
+    if (has_timing)
+        qw.pNext = &qi2;
+#endif
     if (!has_id || !has_wait)
         return NULL;
     i->GetPhysicalDeviceFeatures2(phys, &f2);
     if (!qi.presentId || !qw.presentWait)
         return NULL;
+#ifdef VK_EXT_present_timing
+    *timing = has_timing && qi2.presentId2 && qt.presentTiming;
+#endif
 
-    const char **names = calloc(ci->enabledExtensionCount + 2, sizeof(*names));
+    const char **names = calloc(ci->enabledExtensionCount + 5, sizeof(*names));
     if (!names)
         return NULL;
     uint32_t count = 0;
@@ -1760,19 +1874,41 @@ static const char **present_wait_enable(struct inst *i, VkPhysicalDevice phys, c
     if (!app_wait)
         names[count++] = VK_KHR_PRESENT_WAIT_EXTENSION_NAME;
     *ci2 = *ci;
-    ci2->enabledExtensionCount = count;
-    ci2->ppEnabledExtensionNames = names;
     // a game that names the extensions without their features gets them on (it didn't say off)
     if (!gid) {
-        *pid = (VkPhysicalDevicePresentIdFeaturesKHR){ VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PRESENT_ID_FEATURES_KHR,
-                                                       (void *)ci2->pNext, VK_TRUE };
-        ci2->pNext = pid;
+        x->id = (VkPhysicalDevicePresentIdFeaturesKHR){ VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PRESENT_ID_FEATURES_KHR,
+                                                        (void *)ci2->pNext, VK_TRUE };
+        ci2->pNext = &x->id;
     }
     if (!gw) {
-        *pw = (VkPhysicalDevicePresentWaitFeaturesKHR){ VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PRESENT_WAIT_FEATURES_KHR,
-                                                        (void *)ci2->pNext, VK_TRUE };
-        ci2->pNext = pw;
+        x->wait = (VkPhysicalDevicePresentWaitFeaturesKHR){ VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PRESENT_WAIT_FEATURES_KHR,
+                                                            (void *)ci2->pNext, VK_TRUE };
+        ci2->pNext = &x->wait;
     }
+#ifdef VK_EXT_present_timing
+    if (*timing) {
+        const char *more[] = { VK_KHR_PRESENT_ID_2_EXTENSION_NAME, VK_KHR_CALIBRATED_TIMESTAMPS_EXTENSION_NAME,
+                               VK_EXT_PRESENT_TIMING_EXTENSION_NAME };
+        for (int k = 0; k < 3; k++)
+            if (!names_ext(names, count, more[k]))
+                names[count++] = more[k];
+        if (!gid2) {
+            x->id2 = (VkPhysicalDevicePresentId2FeaturesKHR){
+                VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PRESENT_ID_2_FEATURES_KHR, (void *)ci2->pNext, VK_TRUE };
+            ci2->pNext = &x->id2;
+        }
+        if (!gt) {
+            x->timing = (VkPhysicalDevicePresentTimingFeaturesEXT){
+                .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PRESENT_TIMING_FEATURES_EXT,
+                .pNext = (void *)ci2->pNext,
+                .presentTiming = VK_TRUE,
+            };
+            ci2->pNext = &x->timing;
+        }
+    }
+#endif
+    ci2->enabledExtensionCount = count;
+    ci2->ppEnabledExtensionNames = names;
     return names;
 }
 
@@ -1795,14 +1931,15 @@ static VKAPI_ATTR VkResult VKAPI_CALL CreateDevice(VkPhysicalDevice phys, const 
 
     PFN_vkCreateDevice create = (PFN_vkCreateDevice)gipa(i->handle, "vkCreateDevice");
     VkDeviceCreateInfo ci2;
-    VkPhysicalDevicePresentIdFeaturesKHR pid;
-    VkPhysicalDevicePresentWaitFeaturesKHR pw;
-    const char **names = present_wait_enable(i, phys, ci, &ci2, &pid, &pw);
+    struct device_extras extras;
+    bool timing;
+    const char **names = present_wait_enable(i, phys, ci, &ci2, &extras, &timing);
     VkResult r = VK_ERROR_INITIALIZATION_FAILED;
     if (names)
         r = create(phys, &ci2, alloc, out);
     free(names);
     bool present_wait = names && r == VK_SUCCESS;
+    timing = timing && present_wait;
     if (!present_wait)  // without them (or as the game asked, when adding them failed)
         r = create(phys, ci, alloc, out);
     if (r != VK_SUCCESS)
@@ -1834,11 +1971,20 @@ static VKAPI_ATTR VkResult VKAPI_CALL CreateDevice(VkPhysicalDevice phys, const 
 #undef X
     if (present_wait)
         d->WaitForPresentKHR = (PFN_vkWaitForPresentKHR)gdpa(*out, "vkWaitForPresentKHR");
+#ifdef VK_EXT_present_timing
+    if (timing)
+        d->GetSwapchainTimingPropertiesEXT =
+            (PFN_vkGetSwapchainTimingPropertiesEXT)gdpa(*out, "vkGetSwapchainTimingPropertiesEXT");
+#endif
     pthread_mutex_lock(&lock);
     d->next = devs;
     devs = d;
     pthread_mutex_unlock(&lock);
-    say("on %s%s", props.deviceName, d->WaitForPresentKHR ? "" : ", no present wait (latency = low off)");
+    say("on %s%s%s", props.deviceName, d->WaitForPresentKHR ? "" : ", no present wait (latency = low off)",
+#ifdef VK_EXT_present_timing
+        d->GetSwapchainTimingPropertiesEXT ? ", present timing (refresh rate from the display)" :
+#endif
+        "");
     return VK_SUCCESS;
 }
 
