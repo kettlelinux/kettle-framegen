@@ -92,6 +92,50 @@ def hud(scene):
     return f
 
 
+def glyphs(x, y, x0, y0, cols, seed):
+    """Static HUD text: a row of 5x7 hashed glyphs with a dark outline, or None off the text."""
+    gx, gy = math.floor((x - x0) / 7), math.floor(y - y0)
+    if not (0 <= gx < cols and 0 <= gy < 9):
+        return None
+    cx, cy = math.floor(x - x0) - gx * 7, gy
+    on = lambda i, j: 0 <= i < 5 and 1 <= j < 8 and hash01(seed, gx, i, j) < 0.45
+    if on(cx, cy):
+        return [0.95, 0.9, 0.75]
+    if any(on(cx + di, cy + dj) for di in (-1, 0, 1) for dj in (-1, 0, 1)):
+        return [0.08, 0.06, 0.04]
+    return None
+
+
+def hud_text(scene):
+    """A quest log: two lines of text and a framed panel, still over the moving scene."""
+    def f(x, y, t):
+        g = glyphs(x, y, 150, 20, 14, 1) or glyphs(x, y, 164, 34, 10, 2)
+        if g:
+            return g
+        if 8 <= x < 72 and 8 <= y < 40:  # a minimap-like panel with a border
+            if x < 10 or x >= 70 or y < 10 or y >= 38:
+                return [0.8, 0.65, 0.3]
+            return texture(30)(x * 2, y * 2)
+        return scene(x, y, t)
+
+    return f
+
+
+def menu_cursor(x0, y0, vx, vy):
+    """A mouse cursor (a small bright arrow) moving over a dark, nearly flat menu with dim text."""
+    def f(x, y, t):
+        cx, cy = x - (x0 + vx * t), y - (y0 + vy * t)
+        if 0 <= cy < 14 and 0 <= cx < 0.6 * cy + 1:
+            return [0.9, 0.88, 0.8] if cx < 0.6 * cy - 0.8 and cy < 13 else [0.15, 0.14, 0.12]
+        g = glyphs(x, y, 30, 40, 18, 3) or glyphs(x, y, 30, 96, 14, 4)
+        if g:
+            return [0.35 * c for c in g]
+        n = 0.04 + 0.015 * hash01(9, math.floor(x / 4), math.floor(y / 4))
+        return [n, n, n * 0.9]
+
+    return f
+
+
 def cut(a, b):
     # a scene cut between frames 0 and 1: the right output is the nearer frame
     return lambda x, y, t: a(x, y, 0) if t < 0.5 else b(x, y, 0)
@@ -111,6 +155,10 @@ CASES = {
     "orbit": (figure(pan(12, 10, 0), 13, 128, 72, 22, 40, 0, 0), 3, []),
     # the figure walks one way while the camera pans the other
     "cross": (figure(pan(14, -6, 0), 15, 100, 72, 20, 36, 8, 2), 3, []),
+    # a menu: the cursor moves fast over a dark, almost flat background
+    "cursor": (menu_cursor(100, 60, 14, -6), 2, ["multiplier = 3"]),
+    # HUD text and a panel over a camera turn too fast for the motion search
+    "hud-fast": (hud_text(pan(16, 14, 10)), 2, ["multiplier = 3", "# the scene is beyond the motion search, see make-cases.py", "min_psnr = 25", "max_bad = 0.08"]),
     "hud": (hud(pan(7, -8, 0)), 2, []),
     "edge": (pan(8, 12, 0), 2, []),
     "cut": (cut(pan(9, 0, 0), pan(10, 0, 0)), 2, ["multiplier = 3"]),

@@ -1,0 +1,36 @@
+// SPDX-License-Identifier: BSD-3-Clause
+// HUD mask for synth.comp: 1 where the two frames show still detail (text, a panel's border,
+// the inside of a glyph next to its outline), 0 elsewhere. Still: the pixel is the same in both
+// frames (its neighbours needn't be: a glyph's outline borders the moving scene). Detail:
+// something within two pixels differs sharply, which leaves out flat colour (sky, a dark menu)
+// that looks still under any motion.
+// The scene doesn't move through the HUD, so a moving vector that lands on it is wrong.
+#version 450
+layout(local_size_x = 8, local_size_y = 8) in;
+
+layout(binding = 0) uniform sampler2D prev_img;
+layout(binding = 1) uniform sampler2D cur_img;
+layout(binding = 2, rgba8) uniform writeonly image2D dst;
+
+float diff(vec4 x, vec4 y)
+{
+    vec3 d = abs(x.rgb - y.rgb);
+    return d.r + d.g + d.b;
+}
+
+void main()
+{
+    ivec2 p = ivec2(gl_GlobalInvocationID.xy);
+    ivec2 size = imageSize(dst);
+    if (any(greaterThanEqual(p, size)))
+        return;
+    ivec2 last = size - 1;
+    vec4 c = texelFetch(prev_img, p, 0);
+    float moved = diff(c, texelFetch(cur_img, p, 0));
+    float edge = 0.0;
+    for (int i = 0; i < 4; i++) {
+        ivec2 o = ivec2(i == 0 ? 2 : i == 1 ? -2 : 0, i == 2 ? 2 : i == 3 ? -2 : 0);
+        edge = max(edge, diff(c, texelFetch(prev_img, clamp(p + o, ivec2(0), last), 0)));
+    }
+    imageStore(dst, p, vec4(moved < 0.02 && edge > 0.25 ? 1.0 : 0.0));
+}

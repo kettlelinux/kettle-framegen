@@ -251,11 +251,11 @@ struct run {
     VkExtent2D full;
     uint32_t levels;
     VkExtent2D luma[MAX_LEVELS], mv[MAX_LEVELS];
-    struct img hist[2], pyr[2], mvl[MAX_LEVELS], mvf[2], out[MAX_GEN];
+    struct img hist[2], pyr[2], mvl[MAX_LEVELS], mvf[2], out[MAX_GEN], still;
     VkImageView pyr_level[2][MAX_LEVELS];
     struct buf cut, up, down;
     VkDescriptorPool dpool;
-    VkDescriptorSet ds_luma[2], ds_down[2][MAX_LEVELS], ds_motion[2][MAX_LEVELS], ds_filter[2];
+    VkDescriptorSet ds_luma[2], ds_down[2][MAX_LEVELS], ds_motion[2][MAX_LEVELS], ds_filter[2], ds_still[2];
     VkDescriptorSet ds_synth[2][MAX_GEN];
     VkCommandBuffer cmd;
     VkFence fence;
@@ -338,9 +338,9 @@ static VkDescriptorSet ds_make(struct run *R, int p, const VkImageView *views)
     VkDescriptorSet set;
     CHECK(vkAllocateDescriptorSets(dev, &ai, &set));
     const struct pipe_spec *s = &pipe_specs[p];
-    VkDescriptorImageInfo ii[5];
+    VkDescriptorImageInfo ii[6];
     VkDescriptorBufferInfo bi = { R->cut.buffer, 0, VK_WHOLE_SIZE };
-    VkWriteDescriptorSet w[5];
+    VkWriteDescriptorSet w[6];
     for (uint32_t i = 0; i < s->n; i++) {
         bool isbuf = s->types[i] == VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
         if (!isbuf)
@@ -377,6 +377,7 @@ static void run_create(struct run *R, VkExtent2D full, float flow_scale)
         img_create(&R->mvl[l], vec, R->mv[l], 1, rw);
     for (int k = 0; k < MAX_GEN; k++)
         img_create(&R->out[k], VK_FORMAT_R32_UINT, full, 1, VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT);
+    img_create(&R->still, color, full, 1, rw);
     VkDeviceSize one = (VkDeviceSize)full.width * full.height * 4;
     buf_create(&R->cut, 16, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT |
                                 VK_BUFFER_USAGE_TRANSFER_SRC_BIT, false);
@@ -384,12 +385,12 @@ static void run_create(struct run *R, VkExtent2D full, float flow_scale)
     buf_create(&R->down, one * MAX_GEN + 16, VK_BUFFER_USAGE_TRANSFER_DST_BIT, true);
 
     VkDescriptorPoolSize sizes[] = {
-        { VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 2 * (1 + MAX_LEVELS + 4 * MAX_LEVELS + 1 + 3 * MAX_GEN) },
-        { VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 2 * (1 + MAX_LEVELS + MAX_LEVELS + 1 + MAX_GEN) },
+        { VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 2 * (1 + MAX_LEVELS + 4 * MAX_LEVELS + 1 + 2 + 4 * MAX_GEN) },
+        { VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 2 * (1 + MAX_LEVELS + MAX_LEVELS + 1 + 1 + MAX_GEN) },
         { VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 2 * (1 + MAX_GEN) },
     };
     VkDescriptorPoolCreateInfo dci = { .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO,
-                                       .maxSets = 2 * (1 + MAX_LEVELS + MAX_LEVELS + 1 + MAX_GEN),
+                                       .maxSets = 2 * (1 + MAX_LEVELS + MAX_LEVELS + 1 + 1 + MAX_GEN),
                                        .poolSizeCount = 3, .pPoolSizes = sizes };
     CHECK(vkCreateDescriptorPool(dev, &dci, NULL, &R->dpool));
     for (int c = 0; c < 2; c++) {
@@ -403,9 +404,11 @@ static void run_create(struct run *R, VkExtent2D full, float flow_scale)
                                                                        R->mvf[p].view, R->mvl[l].view });
         }
         R->ds_filter[c] = ds_make(R, P_FILTER, (VkImageView[]){ R->mvl[0].view, R->mvf[c].view });
+        R->ds_still[c] = ds_make(R, P_STILL, (VkImageView[]){ R->hist[p].view, R->hist[c].view, R->still.view });
         for (int k = 0; k < MAX_GEN; k++)
             R->ds_synth[c][k] = ds_make(R, P_SYNTH, (VkImageView[]){ R->hist[p].view, R->hist[c].view,
-                                                                     R->mvf[c].view, R->out[k].view });
+                                                                     R->mvf[c].view, R->out[k].view, NULL,
+                                                                     R->still.view });
     }
     VkCommandBufferAllocateInfo cai = { .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO,
                                         .commandPool = pool, .level = VK_COMMAND_BUFFER_LEVEL_PRIMARY,
@@ -431,6 +434,7 @@ static void run_free(struct run *R)
         img_free(&R->mvl[l]);
     for (int k = 0; k < MAX_GEN; k++)
         img_free(&R->out[k]);
+    img_free(&R->still);
     buf_free(&R->cut);
     buf_free(&R->up);
     buf_free(&R->down);
@@ -478,10 +482,10 @@ static void frame(struct run *R, const struct pic *pic, int c, bool first, uint3
     CHECK(vkBeginCommandBuffer(cmd, &bi));
     if (first) {
         // all images live in GENERAL
-        VkImageMemoryBarrier b[2 * 3 + MAX_GEN + MAX_LEVELS];
+        VkImageMemoryBarrier b[2 * 3 + MAX_GEN + 1 + MAX_LEVELS];
         uint32_t n = 0;
         struct img *all[] = { &R->hist[0], &R->hist[1], &R->pyr[0], &R->pyr[1], &R->mvf[0], &R->mvf[1],
-                              &R->out[0], &R->out[1] };
+                              &R->out[0], &R->out[1], &R->still };
         _Static_assert(MAX_GEN == 2, "out[] list above");
         for (uint32_t i = 0; i < sizeof(all) / sizeof(*all) + R->levels; i++)
             b[n++] = (VkImageMemoryBarrier){
@@ -527,6 +531,7 @@ static void frame(struct run *R, const struct pic *pic, int c, bool first, uint3
                 compute_to_compute(cmd);
             }
             dispatch(cmd, P_FILTER, R->ds_filter[c], NULL, 0, R->mv[0]);
+            dispatch(cmd, P_STILL, R->ds_still[c], NULL, 0, full);
             compute_to_compute(cmd);
         }
         // 4. the in-between frames

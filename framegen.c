@@ -329,10 +329,10 @@ struct swapchain {
     VkQueryPool queries;
     uint32_t levels;
     VkExtent2D luma[MAX_LEVELS], mv[MAX_LEVELS];
-    struct img hist[2], pyr[2], mvl[MAX_LEVELS], mvf[2], out[MAX_GEN];
+    struct img hist[2], pyr[2], mvl[MAX_LEVELS], mvf[2], out[MAX_GEN], still;  // still: synth.comp's HUD mask
     VkImageView pyr_level[2][MAX_LEVELS];
     VkDescriptorPool dpool;
-    VkDescriptorSet ds_luma[2], ds_down[2][MAX_LEVELS], ds_motion[2][MAX_LEVELS], ds_filter[2];
+    VkDescriptorSet ds_luma[2], ds_down[2][MAX_LEVELS], ds_motion[2][MAX_LEVELS], ds_filter[2], ds_still[2];
     VkDescriptorSet ds_synth[2][MAX_GEN];
     int cur;             // history slot the next presented frame goes to
     bool have_prev;      // the other slot holds the previous frame and its pyramid
@@ -607,9 +607,9 @@ static VkDescriptorSet ds_make(struct swapchain *sc, int pipe, const VkImageView
     };
     if (d->AllocateDescriptorSets(d->handle, &ai, &set) != VK_SUCCESS)
         return VK_NULL_HANDLE;
-    VkDescriptorImageInfo ii[5];
+    VkDescriptorImageInfo ii[6];
     VkDescriptorBufferInfo bi = { sc->cut, 0, VK_WHOLE_SIZE };
-    VkWriteDescriptorSet w[5];
+    VkWriteDescriptorSet w[6];
     for (uint32_t i = 0; i < p->n; i++) {
         bool buf = p->types[i] == VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
         if (!buf)
@@ -687,6 +687,7 @@ static void flow_free(struct swapchain *sc)
         img_free(d, &sc->mvl[l]);
     for (int k = 0; k < MAX_GEN; k++)
         img_free(d, &sc->out[k]);
+    img_free(d, &sc->still);
     if (sc->cut)
         d->DestroyBuffer(dev, sc->cut, NULL);
     if (sc->cut_mem)
@@ -783,6 +784,8 @@ static bool flow_build(struct swapchain *sc, float flow_scale)
     for (int k = 0; k < MAX_GEN; k++)
         if (!img_create(d, &sc->out[k], VK_FORMAT_R32_UINT, full, 1, VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT))
             return false;
+    if (!img_create(d, &sc->still, color, full, 1, rw))  // RGBA8: a storage format every GPU has
+        return false;
 
     if (!buffer_create(d, &sc->cut, &sc->cut_mem, 16,
                        VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT |
@@ -790,13 +793,13 @@ static bool flow_build(struct swapchain *sc, float flow_scale)
         return false;
 
     VkDescriptorPoolSize sizes[] = {
-        { VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 2 * (1 + MAX_LEVELS + 4 * MAX_LEVELS + 1 + 3 * MAX_GEN) },
-        { VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 2 * (1 + MAX_LEVELS + MAX_LEVELS + 1 + MAX_GEN) },
+        { VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 2 * (1 + MAX_LEVELS + 4 * MAX_LEVELS + 1 + 2 + 4 * MAX_GEN) },
+        { VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 2 * (1 + MAX_LEVELS + MAX_LEVELS + 1 + 1 + MAX_GEN) },
         { VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 2 * (1 + MAX_GEN) },
     };
     VkDescriptorPoolCreateInfo dci = {
         .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO,
-        .maxSets = 2 * (1 + MAX_LEVELS + MAX_LEVELS + 1 + MAX_GEN),
+        .maxSets = 2 * (1 + MAX_LEVELS + MAX_LEVELS + 1 + 1 + MAX_GEN),
         .poolSizeCount = 3,
         .pPoolSizes = sizes,
     };
@@ -815,9 +818,10 @@ static bool flow_build(struct swapchain *sc, float flow_scale)
                             sc->pyr[p].view, sc->pyr[c].view, coarse, sc->mvf[p].view, sc->mvl[l].view }));
         }
         ok = ok && (sc->ds_filter[c] = ds_make(sc, P_FILTER, (VkImageView[]){ sc->mvl[0].view, sc->mvf[c].view }));
+        ok = ok && (sc->ds_still[c] = ds_make(sc, P_STILL, (VkImageView[]){ sc->hist[p].view, sc->hist[c].view, sc->still.view }));
         for (int k = 0; k < MAX_GEN; k++)
             ok = ok && (sc->ds_synth[c][k] = ds_make(sc, P_SYNTH, (VkImageView[]){
-                            sc->hist[p].view, sc->hist[c].view, sc->mvf[c].view, sc->out[k].view }));
+                            sc->hist[p].view, sc->hist[c].view, sc->mvf[c].view, sc->out[k].view, NULL, sc->still.view }));
         if (!ok)
             return false;
     }
@@ -901,7 +905,7 @@ static void record(struct swapchain *sc, VkCommandBuffer cmd, int slot, uint32_t
     if (sc->fresh) {
         // all our images live in GENERAL
         struct img *all[] = { &sc->hist[0], &sc->hist[1], &sc->pyr[0], &sc->pyr[1], &sc->mvf[0], &sc->mvf[1],
-                              &sc->out[0], &sc->out[1] };
+                              &sc->out[0], &sc->out[1], &sc->still };
         _Static_assert(MAX_GEN == 2, "out[] list above");
         VkImageMemoryBarrier b[sizeof(all) / sizeof(*all) + MAX_LEVELS];
         uint32_t n = 0;
@@ -963,6 +967,7 @@ static void record(struct swapchain *sc, VkCommandBuffer cmd, int slot, uint32_t
                 compute_to_compute(d, cmd);
             }
             run(d, cmd, P_FILTER, sc->ds_filter[c], NULL, 0, sc->mv[0]);
+            run(d, cmd, P_STILL, sc->ds_still[c], NULL, 0, full);
             compute_to_compute(d, cmd);
         }
         STAMP(TS_MOTION);
