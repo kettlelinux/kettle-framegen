@@ -30,6 +30,7 @@ layout(push_constant) uniform PC {
 } pc;
 
 const int B = 8;
+const float CHROMA = 0.25;  // weight of colour (.g, .b: luma0.comp) against luma (.r)
 const float NONE = 1e9;
 const float GOOD = 16.0 * 0.01;  // cost of a near-exact match: 0.01 mean luma difference
 
@@ -37,19 +38,26 @@ vec2 base;    // block origin, level pixels
 vec2 pred;    // vector the penalty is measured from
 float lod;
 
-// Sum of absolute luma differences over a 4x4 grid in the block. Each tap sits on a texel
-// corner, so bilinear filtering averages 2x2 texels and the grid still covers every pixel.
+float luma_cost, best_luma;  // cost() without the colour, as stored for filter.comp and synth.comp
+
+// Sum of absolute luma and (weighed by CHROMA) colour differences over a 4x4 grid in the block.
+// Each tap sits on a texel corner, so bilinear filtering averages 2x2 texels and the grid still
+// covers every pixel. Colour finds edges between colours of the same brightness; the cost
+// stored with the vector is the luma part, which the thresholds downstream were set for.
 float cost(vec2 v)
 {
     vec2 h = 0.5 * v;
-    float s = 0.0;
+    float s = 0.0, sl = 0.0;
     for (int j = 0; j < 4; j++)
         for (int i = 0; i < 4; i++) {
             vec2 q = base + vec2(2 * i + 1, 2 * j + 1);
-            s += abs(textureLod(prev_pyr, (q - h) / pc.luma_size, lod).r -
-                     textureLod(cur_pyr, (q + h) / pc.luma_size, lod).r);
+            vec3 d = abs(textureLod(prev_pyr, (q - h) / pc.luma_size, lod).rgb -
+                         textureLod(cur_pyr, (q + h) / pc.luma_size, lod).rgb);
+            s += d.r + CHROMA * (d.g + d.b);
+            sl += d.r;
         }
     vec2 d = abs(v - pred);
+    luma_cost = sl + pc.lambda * (d.x + d.y);
     return s + pc.lambda * (d.x + d.y);
 }
 
@@ -58,6 +66,7 @@ void try_vector(vec2 v, inout vec2 best, inout float best_cost)
     float c = cost(v);
     if (c < best_cost) {
         best_cost = c;
+        best_luma = luma_cost;
         best = v;
     }
 }
@@ -98,7 +107,7 @@ void main()
     }
 
     if (pc.coarsest == 0 && best_cost < GOOD) {
-        imageStore(dst, b, vec4(best, best_cost / 16.0, 0.0));
+        imageStore(dst, b, vec4(best, best_luma / 16.0, 0.0));
         return;
     }
 
@@ -117,5 +126,5 @@ void main()
                     try_vector(center + 0.5 * vec2(x, y), best, best_cost);
     }
 
-    imageStore(dst, b, vec4(best, best_cost / 16.0, 0.0));
+    imageStore(dst, b, vec4(best, best_luma / 16.0, 0.0));
 }
