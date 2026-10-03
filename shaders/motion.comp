@@ -30,7 +30,8 @@ layout(push_constant) uniform PC {
 } pc;
 
 const int B = 8;
-const float CHROMA = 0.25;  // weight of colour (.g, .b: luma0.comp) against luma (.r)
+const float CHROMA = 0.25;  // weight of colour (.g, .b: luma0.comp) against luma (.r)...
+float chroma;               // ...in this block: where its luma is flat (see main)
 const float NONE = 1e9;
 const float GOOD = 16.0 * 0.01;  // cost of a near-exact match: 0.01 mean luma difference
 
@@ -53,7 +54,7 @@ float cost(vec2 v)
             vec2 q = base + vec2(2 * i + 1, 2 * j + 1);
             vec3 d = abs(textureLod(prev_pyr, (q - h) / pc.luma_size, lod).rgb -
                          textureLod(cur_pyr, (q + h) / pc.luma_size, lod).rgb);
-            s += d.r + CHROMA * (d.g + d.b);
+            s += d.r + chroma * (d.g + d.b);
             sl += d.r;
         }
     vec2 d = abs(v - pred);
@@ -83,6 +84,16 @@ void main()
         return;
     base = vec2(b * B);
     lod = float(pc.level);
+    // Colour only where luma can't tell: a block with luma detail matches on it, and colour
+    // there (around a character, say) only adds noise to the choice
+    float lo = 1.0, hi = 0.0;
+    for (int j = 0; j < 4; j++)
+        for (int i = 0; i < 4; i++) {
+            float l = textureLod(cur_pyr, (base + vec2(2 * i + 1, 2 * j + 1)) / pc.luma_size, lod).r;
+            lo = min(lo, l);
+            hi = max(hi, l);
+        }
+    chroma = CHROMA * (1.0 - smoothstep(0.04, 0.12, hi - lo));
     float scale = exp2(-lod);  // level-0 pixels to this level's
 
     vec2 temporal_v = vec2(0.0);
