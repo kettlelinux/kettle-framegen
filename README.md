@@ -14,7 +14,9 @@ no image is shared between devices. On each `vkQueuePresentKHR` the layer:
 4. fills spare swapchain images with frames interpolated along that motion,
 5. presents those, then the game's frame. FIFO paces them.
 
-Swapchains get up to 3 extra images for the generated frames, so the highest multiplier is 4x.
+Swapchains get up to 2 extra images for the generated frames, so the highest multiplier is 3x.
+Beyond that, too few frames are real: below about 50 rendered fps, generated frames show more
+artifacts than they smooth.
 
 ## Building
 
@@ -110,7 +112,7 @@ example `KETTLE_FG_MULTIPLIER=3`) overrides the file.
 
 | Key | Default | Meaning |
 | --- | --- | --- |
-| `multiplier` | `2` | Frames shown per rendered frame, 1 to 4, or `auto` (below). `1` turns generation off. |
+| `multiplier` | `2` | Frames shown per rendered frame, 1 to 3, or `auto` (below). `1` turns generation off. |
 | `refresh` | measured | Display refresh rate in Hz, for `auto`. Set it: the measurement is a fallback. |
 | `mode` | `motion` | `blend` mixes frames without motion estimation. |
 | `flow_scale` | `0.5` | Resolution of the motion estimate as a fraction of the frame, 0.1 to 1. |
@@ -122,13 +124,14 @@ example `KETTLE_FG_MULTIPLIER=3`) overrides the file.
 With FIFO, frames are shown evenly only when the game renders fast enough to fill every refresh
 with the multiplier: a 45 fps game at 2x on a 120 Hz display shows each generated frame for one
 refresh and each rendered one for nearly two, which judders. `multiplier = auto` picks the
-fewest frames per rendered one that fill every refresh (4x at 45 fps on 180 Hz), and FIFO then
-holds the game at refresh / multiplier (45 fps here). Whether the game could fill it with one
+fewest frames per rendered one that fill every refresh (3x at 70 fps on 180 Hz), and FIFO then
+holds the game at refresh / multiplier (60 fps here). Whether the game could fill it with one
 less doesn't show while it is held, so the layer tries one less now and then: it keeps it if
 the display still fills, and otherwise goes back (a second or two of judder) and doubles the
-wait before the next try, up to 5 minutes. A raise that shows no more frames than before (4x
-can run short of swapchain images) is undone and not retried for 10 seconds, doubling while it
-keeps failing. The log shows each change.
+wait before the next try, up to 5 minutes. A raise that falls well short of the frames it
+should show (the swapchain can run short of images) is undone and not retried for 10 seconds,
+doubling while it keeps failing. A game slower than refresh / 3 (60 fps on 180 Hz) can't fill
+every refresh even at 3x. The log shows each change.
 
 Set `refresh` for `auto`. Without it, the layer takes the display as full when the game waits
 for it and measures the refresh rate there, but a GPU-bound game also waits short of full, so

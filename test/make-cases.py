@@ -103,7 +103,7 @@ CASES = {
     # beyond the motion search's reach at this size: shows how that fails, and the vectors are
     # chaotic enough that drivers disagree on many of them
     "pan-fast": (pan(2, 20, -6), 2, ["# chaotic vectors, see make-cases.py", "min_psnr = 25", "max_bad = 0.08"]),
-    "pan-x4": (pan(3, 9, 3), 2, ["multiplier = 4"]),
+    "pan-x3": (pan(3, 9, 3), 2, ["multiplier = 3"]),
     "pan-full-scale": (pan(4, 6, 2), 2, ["flow_scale = 1.0"]),
     "blend": (pan(1, 6, 2), 2, ["mode = blend"]),
     "object": (obj(5, 6, 60, 40, 48, 10, 4), 3, []),

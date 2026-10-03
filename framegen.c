@@ -34,7 +34,7 @@
 #define EXPORT __attribute__((visibility("default")))
 #define LAYER "VK_LAYER_KETTLE_framegen"
 #define KEY(h) (*(void **)(h))
-#define MAX_GEN 3          // generated frames per rendered one (4x)
+#define MAX_GEN 2          // generated frames per rendered one (3x); beyond it, too few real frames
 #define RING 3             // presents in flight
 #define MAX_QUEUES 64
 // GPU timestamps per present: start, then the end of each stage
@@ -901,8 +901,8 @@ static void record(struct swapchain *sc, VkCommandBuffer cmd, int slot, uint32_t
     if (sc->fresh) {
         // all our images live in GENERAL
         struct img *all[] = { &sc->hist[0], &sc->hist[1], &sc->pyr[0], &sc->pyr[1], &sc->mvf[0], &sc->mvf[1],
-                              &sc->out[0], &sc->out[1], &sc->out[2] };
-        _Static_assert(MAX_GEN == 3, "out[] list above");
+                              &sc->out[0], &sc->out[1] };
+        _Static_assert(MAX_GEN == 2, "out[] list above");
         VkImageMemoryBarrier b[sizeof(all) / sizeof(*all) + MAX_LEVELS];
         uint32_t n = 0;
         for (size_t i = 0; i < sizeof(all) / sizeof(*all); i++)
@@ -1153,8 +1153,8 @@ static void stats(struct swapchain *sc, int slot, int multiplier)
 // the display is full when the game waits for it, which a GPU-bound game also does short of
 // full (the compositor hands images back only once the GPU is done with them).
 // A raise that falls well short of the frames it should show (the rendered rate before it times
-// the new multiplier, at most the refresh rate) costs rendered frames for little (4x can run out
-// of swapchain images to queue its frames in), so it is undone and not repeated for a while.
+// the new multiplier, at most the refresh rate) costs rendered frames for little (the swapchain
+// can run short of images to queue its frames in), so it is undone and not repeated for a while.
 static int pace(struct swapchain *sc, double t, float refresh)
 {
     struct pacing *p = &sc->pace;
@@ -1192,7 +1192,7 @@ static int pace(struct swapchain *sc, double t, float refresh)
         say("auto multiplier %dx shows %.1f frames per second of %.1f, back to %dx, not again for %.0f s", n,
             shown, due, p->up_from, p->cap_wait);
         // the game may just have slowed at the same time: a short cap at first, longer
-        // when the same raise keeps failing (4x short of swapchain images)
+        // when the same raise keeps failing (short of swapchain images)
         p->cap = n - 1;
         n = p->up_from;
         p->cap_until = t + p->cap_wait;

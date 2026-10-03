@@ -38,7 +38,7 @@
 
 #include "shaders.h"
 
-#define MAX_GEN 3  // as framegen.c
+#define MAX_GEN 2  // as framegen.c
 #define BAD_DIFF 24
 
 static VkInstance instance;
@@ -481,8 +481,8 @@ static void frame(struct run *R, const struct pic *pic, int c, bool first, uint3
         VkImageMemoryBarrier b[2 * 3 + MAX_GEN + MAX_LEVELS];
         uint32_t n = 0;
         struct img *all[] = { &R->hist[0], &R->hist[1], &R->pyr[0], &R->pyr[1], &R->mvf[0], &R->mvf[1],
-                              &R->out[0], &R->out[1], &R->out[2] };
-        _Static_assert(MAX_GEN == 3, "out[] list above");
+                              &R->out[0], &R->out[1] };
+        _Static_assert(MAX_GEN == 2, "out[] list above");
         for (uint32_t i = 0; i < sizeof(all) / sizeof(*all) + R->levels; i++)
             b[n++] = (VkImageMemoryBarrier){
                 .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
