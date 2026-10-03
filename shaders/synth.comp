@@ -2,11 +2,15 @@
 // One generated frame at time t between the previous (0) and current (1) frame.
 // Each pixel follows a motion vector back into the previous frame and forward into the current
 // one and blends the two by t. The vector is picked per pixel: the block field interpolated
-// here, the four nearest block vectors, or zero, whichever makes the two frames agree best (with
-// a small bias to the interpolated one). That keeps motion edges sharp where interpolated
+// here, the four nearest block vectors, or zero, whichever makes the two frames agree best
+// (with a small bias to the interpolated one). That keeps motion edges sharp where interpolated
 // vectors would mix two motions, and static overlays (HUDs) still where their block moves.
-// Agreement is measured over the pixel and its left and right neighbours, so a single pixel
-// can't pick a vector its neighbourhood disagrees with (lone specks).
+// Agreement is measured over the pixel and the better of its left and right neighbours, so a
+// single pixel can't pick a vector its neighbourhood disagrees with (lone specks), while one at
+// a figure's edge, whose neighbour outside moves another way, can still pick the figure's.
+// Where two vectors fit, one from a figure in front and one from the background, the figure's
+// wins: the background's fits through a figure thinner than its motion (a sword), as both its
+// samples land on background beside it, and picking it would cut the figure out.
 // HUDs stay put over a moving scene: a pixel the same in both frames, with its left and right
 // neighbours, is still and kept as it is (any vector landing on flat HUD colour in both frames
 // would match it as well), and a moving vector whose sample lands on anything still
@@ -20,12 +24,16 @@
 // (games move the camera; the figures are what moves differently), and along it, one frame's
 // sample shows the figure. That one is told apart by following it with the figure's vector into
 // the other frame and finding it again there; the pixel comes from the other frame alone.
-// Where that doesn't settle it, it comes from the frame nearer in time. Where a vector leads
-// outside one frame (content coming into view at the screen edge), only the other frame is used.
+// Where that doesn't settle it, it comes from the frame nearer in time. And where the
+// background's vector fails and no figure's fits, but that test finds the figure, the pixel is
+// such background even if some other vector agrees, by chance (specks beside a thin figure).
+// Where a vector leads outside one frame (content coming into view at the screen edge), only
+// the other frame is used.
 // On a scene cut (filter.comp counts blocks no vector matched) the frame is the nearer real one,
 // and so, fading in, is any region whose blocks matched poorly (motion too fast or too small to
 // follow: a camera whipping round, a mouse cursor): a real frame shown again looks steadier
-// than a patchwork of vectors that half fit.
+// than a patchwork of vectors that half fit. Where the blocks there still matched fairly (the
+// content changed, not the motion lost), that frame is moved along their vectors.
 // Colors stay in the swapchain's raw channel order and encoding, packed into its 32-bit layout
 // (8-bit RGBA or 10:10:10:2): the result is copied back as is. Colour maths is mediump (fp16
 // where the GPU has it); coordinates need full precision at 1080p.
@@ -43,6 +51,8 @@ layout(binding = 4) readonly buffer Cut {
 layout(binding = 5) uniform sampler2D hud;  // still.comp: 1 where the frames are the same
 
 const float LOST_FROM = 0.02, LOST_TO = 0.04;  // block match cost: motion followed .. lost
+const float UNMATCHED = 0.06;  // block match cost from which its vectors are no use at all
+const float EDGE = 4.0;        // block vectors this far apart (pixels): a figure's edge
 
 layout(push_constant) uniform PC {
     vec2 size;      // frame, pixels
@@ -76,6 +86,13 @@ mediump float diff(mediump vec4 x, mediump vec4 y)
 
 mediump vec4 a, b;  // previous and current frame along the chosen vector
 mediump float best = 1e4;
+vec2 mean;                   // the frame's mean motion: the camera's
+mediump float figure = 1e4;  // the best match of a vector away from it: a figure's
+float scale;                 // how much of the frame is lost (see main): 1 none .. 0 all
+mediump float lost = 0.0;    // how lost the motion is here
+
+const mediump float FIGURE_MATCH = 0.2;  // a figure's vector matching better than this...
+const mediump float FIGURE_GAIN = 0.1;   // ...is preferred by up to this much
 
 // On or next to the HUD: filtered, the mask reaches a pixel past its edge
 bool on_hud(vec2 p)
@@ -83,57 +100,69 @@ bool on_hud(vec2 p)
     return textureLod(hud, p / pc.size, 0.0).r > 0.01;
 }
 
-void try_vector(vec2 q, vec2 v, mediump float bias)
+mediump float try_vector(vec2 q, vec2 v, mediump float bias)
 {
     vec2 qa = q - pc.t * v, qb = q + (1.0 - pc.t) * v;
     bool ina = inside(qa), inb = inside(qb);
     if (!ina && !inb)
-        return;
+        return 1e4;
     vec2 rcp = 1.0 / pc.size;
     mediump vec4 pa = textureLod(prev_img, qa * rcp, 0.0);
     mediump vec4 pb = textureLod(cur_img, qb * rcp, 0.0);
     mediump float c;
     if (ina && inb) {
         vec2 dx = vec2(1.0, 0.0);
-        c = diff(pa, pb) +
-            0.5 * diff(textureLod(prev_img, (qa - dx) * rcp, 0.0), textureLod(cur_img, (qb - dx) * rcp, 0.0)) +
-            0.5 * diff(textureLod(prev_img, (qa + dx) * rcp, 0.0), textureLod(cur_img, (qb + dx) * rcp, 0.0));
+        mediump float l = diff(textureLod(prev_img, (qa - dx) * rcp, 0.0), textureLod(cur_img, (qb - dx) * rcp, 0.0));
+        mediump float r = diff(textureLod(prev_img, (qa + dx) * rcp, 0.0), textureLod(cur_img, (qb + dx) * rcp, 0.0));
+        c = diff(pa, pb) + 2.0 * min(l, r);
         if (dot(v, v) > 2.25 && (on_hud(qa) || on_hud(qb)))
             c += 1.0;  // a moving vector on the HUD
     } else {
         // one side has left the frame: nothing to check against, so only take this
         // vector when nothing that can be checked fits, and never from the HUD
         if (dot(v, v) > 2.25 && on_hud(ina ? qa : qb))
-            return;
+            return 1e4;
         if (ina)
             pb = pa;
         else
             pa = pb;
         c = 0.3;
     }
+    // a figure's vector that matches is in front: prefer it to the background's, which matches
+    // too where it looks straight through a thin figure (a sword) at background on both sides
+    // (where it only matches as the colour around is flat, either is right). Where the motion
+    // is lost, the figure's matches worse (a sword's highlights change as it turns) and the
+    // background's looks through more of it (it moves further): preferred more, and sooner.
+    if (ina && inb) {
+        mediump float fm = FIGURE_MATCH * (1.0 + 2.0 * lost);
+        c -= FIGURE_GAIN * (1.0 + 3.0 * lost) * (1.0 - smoothstep(0.5 * fm, fm, c)) *
+             smoothstep(1.0, 4.0, distance(v, mean));
+    }
     c += bias;
+    if (distance(v, mean) > 2.0)
+        figure = min(figure, c);
     if (c < best) {
         best = c;
         a = pa;
         b = pb;
     }
+    return c;
 }
 
 // Where the pixel at q is background hidden in one frame by a figure in front: that frame's
 // sample along the background vector vb is the figure, which moving on with vf turns up again
-// in the other frame. Returns the other frame's sample, or `keep` when that doesn't settle it.
-mediump vec4 uncovered(vec2 q, vec2 vb, vec2 vf, mediump vec4 keep)
+// in the other frame. True when that settles it, with the other frame's sample in `shown`.
+bool uncovered(vec2 q, vec2 vb, vec2 vf, out mediump vec4 shown)
 {
     vec2 qa = q - pc.t * vb, qb = q + (1.0 - pc.t) * vb;
     if (!inside(qa) || !inside(qb))
-        return keep;
+        return false;
     vec2 rcp = 1.0 / pc.size;
     mediump vec4 pa = textureLod(prev_img, qa * rcp, 0.0), pb = textureLod(cur_img, qb * rcp, 0.0);
     bool a_hidden = inside(qa + vf) && diff(pa, textureLod(cur_img, (qa + vf) * rcp, 0.0)) < 0.12;
     bool b_hidden = inside(qb - vf) && diff(pb, textureLod(prev_img, (qb - vf) * rcp, 0.0)) < 0.12;
-    if (a_hidden == b_hidden)
-        return keep;
-    return a_hidden ? pb : pa;
+    shown = a_hidden ? pb : pa;
+    return a_hidden != b_hidden;
 }
 
 void main()
@@ -152,8 +181,11 @@ void main()
         imageStore(dst, p, uvec4(pack(pc.t < 0.5 ? textureLod(prev_img, uv, 0.0) : textureLod(cur_img, uv, 0.0))));
         return;
     }
+    mean = vec2(cut.sum) / (16.0 * float(grid.x * grid.y)) * pc.mv_to_px;
     vec2 cand[6];  // the block field here, the four nearest blocks, zero
-    float matched = 1.0;  // the best match cost of the blocks around (filter.comp: 3x3 each)
+    mediump float cost[6];
+    float spread = 0.0;  // how far apart the nearest blocks' vectors are from the field here
+    float matched = 1.0;  // the best match cost around (filter.comp: of 3x3 blocks), interpolated
     vec2 rcp = 1.0 / pc.size, dx = vec2(1.0, 0.0);
     mediump vec4 sa = textureLod(prev_img, q * rcp, 0.0), sb = textureLod(cur_img, q * rcp, 0.0);
     if (flow) {
@@ -165,44 +197,100 @@ void main()
         vec2 f = q * pc.mv_uv * vec2(grid) - 0.5;  // position in the block grid
         ivec2 i = ivec2(floor(f));
         ivec2 last = grid - 1;
-        cand[0] = textureLod(mv, q * pc.mv_uv, 0.0).xy * pc.mv_to_px;
+        vec4 here = textureLod(mv, q * pc.mv_uv, 0.0);
+        cand[0] = here.xy * pc.mv_to_px;
+        // interpolated, not the nearest blocks' least: where the fallback below starts and
+        // stops it fades over a block instead of showing the block grid (rectangles of the
+        // nearer frame among interpolated ones, flickering from frame to frame)
+        matched = here.w;
+        // where the blocks around matched poorly (mean luma difference about 0.01 where they
+        // do, 0.08 counts as unmatched): one poor block is the edge of a moving figure, which
+        // the vectors below handle, but a whole region is motion they don't follow. And the
+        // more of the frame is lost (a camera whipping round), the sooner (from 30% of blocks
+        // unmatched, all of it: the frame is a real one shown again). Not from fewer: in a fast
+        // turn in Skyrim 10-25% of blocks go unmatched (the strips beside a sword and the hand,
+        // foliage), and showing the nearer frame across all of it put the whole scene where
+        // that frame had it while those that matched were in between (measured against the
+        // real frames in between: half the error at 25%)
+        scale = 1.0 - smoothstep(0.15, 0.3, float(cut.bad_blocks) / float(grid.x * grid.y));
+        lost = scale > 0.0 ? smoothstep(LOST_FROM * scale, LOST_TO * scale, matched) : 1.0;
         for (int k = 0; k < 4; k++) {
             vec4 m = texelFetch(mv, clamp(i + ivec2(k & 1, k >> 1), ivec2(0), last), 0);
             cand[k + 1] = m.xy * pc.mv_to_px;
-            matched = min(matched, m.w);
+            spread = max(spread, distance(cand[k + 1], cand[0]));
         }
+        // where two motions meet (a figure's edge), poor matches are the background one frame
+        // shows and the other doesn't, which the occlusion handling below fills, not motion
+        // lost: in a fast turn that strip is wider than the blocks around that the fallback
+        // judges by, and showing the nearer frame there put the background beside a sword
+        // where that frame had it (a halo growing with the speed)
+        lost *= 1.0 - smoothstep(EDGE, 2.0 * EDGE, spread);
         cand[5] = vec2(0.0);
         for (int k = 0; k < 6; k++)
-            try_vector(q, cand[k], k == 0 ? 0.0 : k < 5 ? 0.04 : 0.08);
+            cost[k] = try_vector(q, cand[k], k == 0 ? 0.0 : k < 5 ? 0.04 : 0.08);
     } else {
         try_vector(q, vec2(0.0), 0.0);
     }
     mediump vec3 d = abs(a.rgb - b.rgb);
     mediump float w = flow ? smoothstep(0.08, 0.25, max(d.r, max(d.g, d.b))) : 0.0;
     mediump vec4 alone = pc.t < 0.5 ? a : b;
-    if (w > 0.0) {
+    if (flow) {
         // background: the candidate nearest the mean motion; figure: the one farthest from it
-        vec2 mean = vec2(cut.sum) / (16.0 * float(grid.x * grid.y)) * pc.mv_to_px;
-        vec2 vb = cand[0], vf = cand[0];
+        int kb = 0;
         for (int k = 1; k < 6; k++)
-            if (distance(cand[k], mean) < distance(vb, mean))
-                vb = cand[k];
+            if (distance(cand[k], mean) < distance(cand[kb], mean))
+                kb = k;
+        vec2 vb = cand[kb], vf = cand[0];
         for (int k = 0; k < 6; k++)
             if (distance(cand[k], vb) > distance(vf, vb))
                 vf = cand[k];
-        if (distance(vf, vb) > 1.0)
-            alone = uncovered(q, vb, vf, alone);
+        // where the background's own vector fails, it is hidden in one frame, and when the
+        // figure is found there, what any vector matched instead was chance (specks beside
+        // thin figures): the frame showing the background is used
+        mediump float occ = smoothstep(0.5, 0.7, cost[kb]) * smoothstep(0.2, 0.4, figure);
+        mediump vec4 shown;
+        if ((w > 0.0 || occ > 0.0) && distance(vf, vb) > 1.0 && uncovered(q, vb, vf, shown)) {
+            alone = shown;
+            w = max(w, occ);
+        }
     }
     mediump vec4 c = mix(mix(a, b, pc.t), alone, w);
-    if (flow) {
-        // where none of the nearest blocks matched (mean luma difference about 0.01 where they
-        // do, 0.08 counts as unmatched): one poor block is the edge of a moving figure, which the
-        // vectors above handle, but a whole region is motion they don't follow
-        // and the more of the frame is lost (a camera whipping round), the sooner
-        // (from 15% of blocks unmatched, all of it: the frame is a real one shown again)
-        float scale = 1.0 - smoothstep(0.06, 0.15, float(cut.bad_blocks) / float(grid.x * grid.y));
-        mediump float lost = scale > 0.0 ? smoothstep(LOST_FROM * scale, LOST_TO * scale, matched) : 1.0;
-        c = mix(c, pc.t < 0.5 ? sa : sb, lost);
+    if (flow && lost > 0.0) {
+        // Lost motion falls back on the nearer frame alone. Where the blocks still matched
+        // fairly, their vectors are right and only the content changed between the frames (a
+        // sword's highlights as it turns): the nearer frame along them, so things still move.
+        // Inside a figure or the background that's the block field here (smooth: no specks);
+        // at a figure's edge, where it would bend the edge into the background, the block
+        // vector that fits best over a wider patch (pixels near each other decide alike).
+        // Where the blocks didn't match at all (motion beyond the search), the vectors are
+        // noise: the nearer frame as it is.
+        mediump vec4 fallback = pc.t < 0.5 ? sa : sb;
+        mediump float useless = scale > 0.0 ? smoothstep(UNMATCHED, UNMATCHED + 0.04, matched) : 1.0;
+        if (useless < 1.0) {
+            vec2 v0 = cand[0];
+            mediump vec4 along = pc.t < 0.5 ? textureLod(prev_img, (q - pc.t * v0) * rcp, 0.0)
+                                            : textureLod(cur_img, (q + (1.0 - pc.t) * v0) * rcp, 0.0);
+            if (spread > EDGE) {
+                mediump vec4 edge = along;
+                mediump float edge_cost = 1e4;
+                for (int k = 0; k < 5; k++) {
+                    vec2 qa = q - pc.t * cand[k], qb = q + (1.0 - pc.t) * cand[k];
+                    mediump float e = 0.0;
+                    for (int j = 0; j < 5; j++) {
+                        vec2 o = j == 0 ? vec2(0.0) : vec2(j < 3 ? 6.0 * float(j) - 9.0 : 0.0,
+                                                              j < 3 ? 0.0 : 6.0 * float(j) - 21.0);
+                        e += diff(textureLod(prev_img, (qa + o) * rcp, 0.0), textureLod(cur_img, (qb + o) * rcp, 0.0));
+                    }
+                    if (e < edge_cost) {
+                        edge_cost = e;
+                        edge = pc.t < 0.5 ? textureLod(prev_img, qa * rcp, 0.0) : textureLod(cur_img, qb * rcp, 0.0);
+                    }
+                }
+                along = mix(along, edge, smoothstep(EDGE, 2.0 * EDGE, spread));
+            }
+            fallback = mix(along, fallback, useless);
+        }
+        c = mix(c, fallback, lost);
     }
     imageStore(dst, p, uvec4(pack(c)));
 }

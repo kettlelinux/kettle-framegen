@@ -79,6 +79,22 @@ def figure(bg_scene, fg_seed, x0, y0, rx, ry, vx, vy):
     return f
 
 
+def blade(scene, hx, hy, length, width, a0, da, vx, vy):
+    """A sword: a thin bright bar from a hilt at (hx, hy), turning by da radians per frame,
+    over the scene. Thinner than a motion block, so the block's vector is the scene's."""
+    def f(x, y, t):
+        a = a0 + da * t
+        dx, dy = x - (hx + vx * t), y - (hy + vy * t)
+        u = dx * math.cos(a) + dy * math.sin(a)
+        w = -dx * math.sin(a) + dy * math.cos(a)
+        if 0 <= u < length and abs(w) < width / 2 * (1 - 0.6 * u / length):
+            s = 0.75 + 0.15 * math.sin(u * 0.7) - 0.25 * abs(w) / width
+            return [s, s * 1.02, s * 1.08]
+        return scene(x, y, t)
+
+    return f
+
+
 def iso(l, r, b):
     """A colour of luma l with the given red and blue: the motion search's luma can't tell it apart."""
     return [r, (l - 0.2126 * r - 0.0722 * b) / 0.7152, b]
@@ -179,6 +195,13 @@ CASES = {
     "orbit": (figure(pan(12, 10, 0), 13, 128, 72, 22, 40, 0, 0), 3, []),
     # the figure walks one way while the camera pans the other
     "cross": (figure(pan(14, -6, 0), 15, 100, 72, 20, 36, 8, 2), 3, []),
+    # a sword held out by a character the camera follows, as the camera turns: the scene pans
+    # past it fast, its vector looking straight through the blade
+    "sword": (blade(pan(18, 12, 0), 110, 110, 90, 5, -1.1, 0.0, 0, 0), 2, []),
+    # the same with the blade drifting a little: no block's vector follows it
+    "sword-drift": (blade(pan(18, 12, 0), 110, 110, 90, 5, -1.1, 0.0, 1, -1), 3, []),
+    # the sword swinging during the turn: every part of the blade moves differently
+    "swing": (blade(pan(19, 8, 2), 120, 120, 80, 5, -2.0, 0.12, 0, 0), 3, []),
     # a menu: the cursor moves fast over a dark, almost flat background
     "cursor": (menu_cursor(100, 60, 14, -6), 2, ["multiplier = 3"]),
     # HUD text and a panel over a camera turn too fast for the motion search
