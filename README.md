@@ -11,8 +11,17 @@ no image is shared between devices. On each `vkQueuePresentKHR` the layer:
 1. copies the presented image into a two-frame history,
 2. builds a luma pyramid of it,
 3. estimates motion between the previous frame and this one, coarse to fine,
-4. fills spare swapchain images with frames interpolated along that motion,
-5. presents those, then the game's frame. FIFO paces them.
+4. marks what stayed the same in both frames (HUDs, black bars), so the scene's motion
+   neither moves it nor samples from it,
+5. fills spare swapchain images with frames interpolated along that motion, taking background
+   that a moving object uncovers from the frame where it shows,
+6. presents those, then the game's frame. FIFO paces them.
+
+Where the motion is lost, because the camera turns faster than the search reaches (about 160
+pixels per frame at 3440x1440), a generated frame shows the nearer real frame again: in the
+regions whose blocks all match poorly, and in the whole frame once enough of its blocks are
+unmatched (from 6%, fully at 15%), as at a scene cut. That is briefly uneven, but cleaner than
+a patchwork of half-fitting vectors.
 
 Swapchains get up to 2 extra images for the generated frames, so the highest multiplier is 3x.
 Beyond that, too few frames are real: below about 50 rendered fps, generated frames show more
@@ -62,7 +71,7 @@ device: llvmpipe (LLVM 21.1.8, 256 bits)
 ...
 object          1-1   cut  0.7%  truth  32.19 dB  ref  63.97 dB   0.00% off  ok
 ...
-10 of 10 cases passed
+14 of 14 cases passed
 ```
 
 Per generated frame: the share of blocks no vector matched (above 30% counts as a scene cut),
