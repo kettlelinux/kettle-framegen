@@ -3,7 +3,8 @@
 #   make install DESTDIR=... PREFIX=/usr
 #   make lib32 && make install-lib32   (32-bit x86 copy for 32-bit games; needs multilib gcc)
 #   make CFLAGS=-I/path/to/Vulkan-Headers/include   (without system vulkan-headers)
-#   make test          run test/cases through the shaders, compare with their references
+#   make test          test multiplier = auto (pacetest), then run test/cases through the shaders and
+#                      compare with their references
 #   make test-update   make the current output the references (review the images first)
 CC ?= cc
 GLSLANG ?= glslangValidator
@@ -18,6 +19,7 @@ HEADERS := $(SHADERS:%=build/%.spv.h)
 LIB := build/libVkLayer_kettle_framegen.so
 LIB32 := build/32/libVkLayer_kettle_framegen.so
 FGTEST := build/fgtest
+PACETEST := build/pacetest
 CASES ?= $(wildcard test/cases/*)
 # $(call build,extra flags)
 build = $(CC) $(CFLAGS) $(1) -std=c11 -D_GNU_SOURCE -Wall -Wextra -Werror -fPIC -shared -fvisibility=hidden \
@@ -42,7 +44,13 @@ $(FGTEST): test/fgtest.c shaders.h $(HEADERS)
 	$(CC) $(CFLAGS) -std=c11 -D_GNU_SOURCE -Wall -Wextra -Werror -I. -Ibuild $(LDFLAGS) -o $@ test/fgtest.c \
 	  -lvulkan -lm
 
-test: $(FGTEST)
+# pace() and the rest of framegen.c, built into a program that drives it on a simulated clock
+$(PACETEST): test/pacetest.c framegen.c shaders.h $(HEADERS)
+	$(CC) $(CFLAGS) -std=c11 -D_GNU_SOURCE -Wall -Wextra -Werror -Ibuild $(LDFLAGS) -o $@ test/pacetest.c \
+	  -lpthread -lm
+
+test: $(PACETEST) $(FGTEST)
+	$(PACETEST)
 	$(FGTEST) $(FGTEST_FLAGS) $(CASES)
 
 test-update: $(FGTEST)

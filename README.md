@@ -64,6 +64,11 @@ the copy that matches its own architecture. `make install-lib32` takes the same 
 compares the generated frames with stored references. It needs the Vulkan loader and a driver;
 without a GPU, Mesa's lavapipe works (CI uses it). `FGTEST_DEVICE=<n>` picks another device.
 
+First, `build/pacetest` runs `multiplier = auto` against a simulated game and FIFO display (a
+game too slow for the display, one faster than it, one that slows down or speeds up, a
+swapchain short of images) and checks the multiplier it settles on and how often it changes.
+`build/pacetest -v` shows the layer's log as it goes.
+
 ```
 $ make test
 build/fgtest  test/cases/blend test/cases/cut ...
