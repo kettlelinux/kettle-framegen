@@ -100,8 +100,16 @@ below) and copy the first and last frame of the dump to a new case as `0.ppm` an
 `multiplier` set to the number of frames the dump holds minus one; then `make test-update
 CASES=test/cases/<name>`. For a case with a truth, set `burst = 8` with `dump`: the next 8 real
 frames in a row are saved, and every other one is the truth for a frame generated between its
-neighbours (`0.ppm`, `1.ppm`, ... from frames 0, 2, 4, ... and `truth/1-1.ppm`, ... from 1, 3,
-...). The motion between them is twice the game's, so they are harder than the game itself.
+neighbours. `test/burst-case.py` turns them into a case (`0.ppm`, `1.ppm`, ... from frames 0, 2,
+4, ... and `truth/1-1.ppm`, ... from 1, 3, ...), cropped with `--crop WxH+X+Y` to what the case
+is about, as full frames are large:
+
+```sh
+test/burst-case.py --crop 960x540+1240+450 <dump dir> test/cases/<name>
+make test-update CASES=test/cases/<name>
+```
+
+The motion between them is twice the game's, so they are harder than the game itself.
 
 ## Using it
 
