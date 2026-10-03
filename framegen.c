@@ -1210,12 +1210,14 @@ static int pace(struct swapchain *sc, double t, float refresh)
             p->trying = true;
         }
     } else {
-        if (p->trying) {
-            p->trying = false;
-            p->down_wait = fmin(2.0 * p->down_wait, PACE_TRY_MAX);
-        }
         // a little short of the refresh rate is close enough to fill it
         int want = hz > 0 ? (int)ceil(hz / fps - 0.03) : n + 1;
+        if (p->trying) {
+            // back to the multiplier that held: the window just tried says little more
+            p->trying = false;
+            p->down_wait = fmin(2.0 * p->down_wait, PACE_TRY_MAX);
+            want = n + 1;
+        }
         if (want > n && n < top) {
             p->up_fps = fps;
             p->up_from = n;
