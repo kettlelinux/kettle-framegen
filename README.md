@@ -64,6 +64,11 @@ the copy that matches its own architecture. `make install-lib32` takes the same 
 compares the generated frames with stored references. It needs the Vulkan loader and a driver;
 without a GPU, Mesa's lavapipe works (CI uses it). `FGTEST_DEVICE=<n>` picks another device.
 
+First, `build/pacetest` runs `multiplier = auto` against a simulated game and FIFO display (a
+game too slow for the display, one faster than it, one that slows down or speeds up, a
+swapchain short of images) and checks the multiplier it settles on and how often it changes.
+`build/pacetest -v` shows the layer's log as it goes.
+
 ```
 $ make test
 build/fgtest  test/cases/blend test/cases/cut ...
@@ -71,7 +76,7 @@ device: llvmpipe (LLVM 21.1.8, 256 bits)
 ...
 object          1-1   cut  0.7%  truth  32.19 dB  ref  63.97 dB   0.00% off  ok
 ...
-14 of 14 cases passed
+19 of 19 cases passed
 ```
 
 Per generated frame: the share of blocks no vector matched (above 30% counts as a scene cut),
@@ -95,8 +100,16 @@ below) and copy the first and last frame of the dump to a new case as `0.ppm` an
 `multiplier` set to the number of frames the dump holds minus one; then `make test-update
 CASES=test/cases/<name>`. For a case with a truth, set `burst = 8` with `dump`: the next 8 real
 frames in a row are saved, and every other one is the truth for a frame generated between its
-neighbours (`0.ppm`, `1.ppm`, ... from frames 0, 2, 4, ... and `truth/1-1.ppm`, ... from 1, 3,
-...). The motion between them is twice the game's, so they are harder than the game itself.
+neighbours. `test/burst-case.py` turns them into a case (`0.ppm`, `1.ppm`, ... from frames 0, 2,
+4, ... and `truth/1-1.ppm`, ... from 1, 3, ...), cropped with `--crop WxH+X+Y` to what the case
+is about, as full frames are large:
+
+```sh
+test/burst-case.py --crop 960x540+1240+450 <dump dir> test/cases/<name>
+make test-update CASES=test/cases/<name>
+```
+
+The motion between them is twice the game's, so they are harder than the game itself.
 
 ## Using it
 
