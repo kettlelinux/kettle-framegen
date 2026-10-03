@@ -195,7 +195,10 @@ void main()
         // where none of the nearest blocks matched (mean luma difference about 0.01 where they
         // do, 0.08 counts as unmatched): one poor block is the edge of a moving figure, which the
         // vectors above handle, but a whole region is motion they don't follow
-        mediump float lost = smoothstep(LOST_FROM, LOST_TO, matched);
+        // and the more of the frame is lost (a camera whipping round), the sooner
+        // (from 15% of blocks unmatched, all of it: the frame is a real one shown again)
+        float scale = 1.0 - smoothstep(0.06, 0.15, float(cut.bad_blocks) / float(grid.x * grid.y));
+        mediump float lost = scale > 0.0 ? smoothstep(LOST_FROM * scale, LOST_TO * scale, matched) : 1.0;
         c = mix(c, pc.t < 0.5 ? sa : sb, lost);
     }
     imageStore(dst, p, uvec4(pack(c)));
