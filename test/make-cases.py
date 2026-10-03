@@ -65,6 +65,20 @@ def obj(bg_seed, fg_seed, x0, y0, size, vx, vy):
     return f
 
 
+def figure(bg_scene, fg_seed, x0, y0, rx, ry, vx, vy):
+    """A rounded figure (an ellipse) over a moving background, like a third-person character:
+    curved edges that cut through the motion blocks."""
+    fg = texture(fg_seed)
+
+    def f(x, y, t):
+        cx, cy = x0 + vx * t, y0 + vy * t
+        if ((x - cx) / rx) ** 2 + ((y - cy) / ry) ** 2 < 1:
+            return fg(x - cx, y - cy)
+        return bg_scene(x, y, t)
+
+    return f
+
+
 def hud(scene):
     def f(x, y, t):
         if 8 <= x < 104 and 116 <= y < 136:  # a status bar
@@ -93,6 +107,10 @@ CASES = {
     "pan-full-scale": (pan(4, 6, 2), 2, ["flow_scale = 1.0"]),
     "blend": (pan(1, 6, 2), 2, ["mode = blend"]),
     "object": (obj(5, 6, 60, 40, 48, 10, 4), 3, []),
+    # a third-person camera turn: the figure stays put while the scene pans behind it
+    "orbit": (figure(pan(12, 10, 0), 13, 128, 72, 22, 40, 0, 0), 3, []),
+    # the figure walks one way while the camera pans the other
+    "cross": (figure(pan(14, -6, 0), 15, 100, 72, 20, 36, 8, 2), 3, []),
     "hud": (hud(pan(7, -8, 0)), 2, []),
     "edge": (pan(8, 12, 0), 2, []),
     "cut": (cut(pan(9, 0, 0), pan(10, 0, 0)), 2, ["multiplier = 3"]),

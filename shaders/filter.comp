@@ -3,7 +3,8 @@
 // which drops lone wrong matches without blurring motion edges.
 // Also counts the blocks whose best match is still poor (mean luma difference above
 // BAD_COST): when most are, the frames are unrelated (a scene cut) and synth.comp stops
-// interpolating.
+// interpolating. Also sums the vectors, whose mean picks out the background where two motions
+// meet (synth.comp).
 #version 450
 layout(local_size_x = 8, local_size_y = 8) in;
 
@@ -11,33 +12,47 @@ layout(binding = 0) uniform sampler2D src;
 layout(binding = 1, rgba16f) uniform writeonly image2D dst;
 layout(binding = 2) buffer Cut {
     uint bad_blocks;
+    ivec2 sum;  // vectors, level-0 pixels in 1/16ths
 } cut;
 
 const float BAD_COST = 0.08;  // motion.comp stores the mean per-sample difference in .z
+
+shared ivec2 group_sum;  // summed per workgroup first: one global atomic per 64 blocks
 
 void main()
 {
     ivec2 b = ivec2(gl_GlobalInvocationID.xy);
     ivec2 size = imageSize(dst);
-    if (any(greaterThanEqual(b, size)))
-        return;
-    vec4 v[9];
-    for (int i = 0; i < 9; i++)
-        v[i] = texelFetch(src, clamp(b + ivec2(i % 3 - 1, i / 3 - 1), ivec2(0), size - 1), 0);
-    int best = 4;
-    float best_d = 1e30;
-    for (int i = 0; i < 9; i++) {
-        float d = 0.0;
-        for (int j = 0; j < 9; j++) {
-            vec2 e = abs(v[i].xy - v[j].xy);
-            d += e.x + e.y;
+    if (gl_LocalInvocationIndex == 0)
+        group_sum = ivec2(0);
+    barrier();
+    if (all(lessThan(b, size))) {
+        vec4 v[9];
+        for (int i = 0; i < 9; i++)
+            v[i] = texelFetch(src, clamp(b + ivec2(i % 3 - 1, i / 3 - 1), ivec2(0), size - 1), 0);
+        int best = 4;
+        float best_d = 1e30;
+        for (int i = 0; i < 9; i++) {
+            float d = 0.0;
+            for (int j = 0; j < 9; j++) {
+                vec2 e = abs(v[i].xy - v[j].xy);
+                d += e.x + e.y;
+            }
+            if (d < best_d) {
+                best_d = d;
+                best = i;
+            }
         }
-        if (d < best_d) {
-            best_d = d;
-            best = i;
-        }
+        imageStore(dst, b, v[best]);
+        if (v[4].z > BAD_COST)
+            atomicAdd(cut.bad_blocks, 1u);
+        ivec2 s = ivec2(round(v[best].xy * 16.0));
+        atomicAdd(group_sum.x, s.x);
+        atomicAdd(group_sum.y, s.y);
     }
-    imageStore(dst, b, v[best]);
-    if (v[4].z > BAD_COST)
-        atomicAdd(cut.bad_blocks, 1u);
+    barrier();
+    if (gl_LocalInvocationIndex == 0) {
+        atomicAdd(cut.sum.x, group_sum.x);
+        atomicAdd(cut.sum.y, group_sum.y);
+    }
 }

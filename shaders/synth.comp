@@ -8,9 +8,14 @@
 // Agreement is measured over the pixel and its left and right neighbours, so a single pixel
 // can't pick a vector its neighbourhood disagrees with (lone specks).
 // Where even the best vector leaves the frames disagreeing, the pixel is occluded in one of
-// them or the motion is wrong, and blending would show both images; there it comes from the
-// frame nearer in time instead. Where a vector leads outside one frame (content coming into
-// view at the screen edge), only the other frame is used.
+// them or the motion is wrong, and blending would show both images. Where two motions meet,
+// it is background that a figure in front covers in one frame (the halo around a character
+// as the camera turns): the background is the candidate closest to the frame's mean motion
+// (games move the camera; the figures are what moves differently), and along it, one frame's
+// sample shows the figure. That one is told apart by following it with the figure's vector into
+// the other frame and finding it again there; the pixel comes from the other frame alone.
+// Where that doesn't settle it, it comes from the frame nearer in time. Where a vector leads
+// outside one frame (content coming into view at the screen edge), only the other frame is used.
 // On a scene cut (filter.comp counts blocks no vector matched) the frame is the nearer real one.
 // Colors stay in the swapchain's raw channel order and encoding, packed into its 32-bit layout
 // (8-bit RGBA or 10:10:10:2): the result is copied back as is. Colour maths is mediump (fp16
@@ -24,6 +29,7 @@ layout(binding = 2) uniform sampler2D mv;
 layout(binding = 3, r32ui) uniform writeonly uimage2D dst;
 layout(binding = 4) readonly buffer Cut {
     uint bad_blocks;
+    ivec2 sum;  // vectors, level-0 pixels in 1/16ths
 } cut;
 
 layout(push_constant) uniform PC {
@@ -91,6 +97,23 @@ void try_vector(vec2 q, vec2 v, mediump float bias)
     }
 }
 
+// Where the pixel at q is background hidden in one frame by a figure in front: that frame's
+// sample along the background vector vb is the figure, which moving on with vf turns up again
+// in the other frame. Returns the other frame's sample, or `keep` when that doesn't settle it.
+mediump vec4 uncovered(vec2 q, vec2 vb, vec2 vf, mediump vec4 keep)
+{
+    vec2 qa = q - pc.t * vb, qb = q + (1.0 - pc.t) * vb;
+    if (!inside(qa) || !inside(qb))
+        return keep;
+    vec2 rcp = 1.0 / pc.size;
+    mediump vec4 pa = textureLod(prev_img, qa * rcp, 0.0), pb = textureLod(cur_img, qb * rcp, 0.0);
+    bool a_hidden = inside(qa + vf) && diff(pa, textureLod(cur_img, (qa + vf) * rcp, 0.0)) < 0.12;
+    bool b_hidden = inside(qb - vf) && diff(pb, textureLod(prev_img, (qb - vf) * rcp, 0.0)) < 0.12;
+    if (a_hidden == b_hidden)
+        return keep;
+    return a_hidden ? pb : pa;
+}
+
 void main()
 {
     ivec2 p = ivec2(gl_GlobalInvocationID.xy);
@@ -107,21 +130,37 @@ void main()
         imageStore(dst, p, uvec4(pack(pc.t < 0.5 ? textureLod(prev_img, uv, 0.0) : textureLod(cur_img, uv, 0.0))));
         return;
     }
+    vec2 cand[6];  // the block field here, the four nearest blocks, zero
     if (flow) {
         vec2 f = q * pc.mv_uv * vec2(grid) - 0.5;  // position in the block grid
         ivec2 i = ivec2(floor(f));
         ivec2 last = grid - 1;
-        try_vector(q, textureLod(mv, q * pc.mv_uv, 0.0).xy * pc.mv_to_px, 0.0);
-        try_vector(q, texelFetch(mv, clamp(i, ivec2(0), last), 0).xy * pc.mv_to_px, 0.04);
-        try_vector(q, texelFetch(mv, clamp(i + ivec2(1, 0), ivec2(0), last), 0).xy * pc.mv_to_px, 0.04);
-        try_vector(q, texelFetch(mv, clamp(i + ivec2(0, 1), ivec2(0), last), 0).xy * pc.mv_to_px, 0.04);
-        try_vector(q, texelFetch(mv, clamp(i + ivec2(1, 1), ivec2(0), last), 0).xy * pc.mv_to_px, 0.04);
-        try_vector(q, vec2(0.0), 0.08);
+        cand[0] = textureLod(mv, q * pc.mv_uv, 0.0).xy * pc.mv_to_px;
+        cand[1] = texelFetch(mv, clamp(i, ivec2(0), last), 0).xy * pc.mv_to_px;
+        cand[2] = texelFetch(mv, clamp(i + ivec2(1, 0), ivec2(0), last), 0).xy * pc.mv_to_px;
+        cand[3] = texelFetch(mv, clamp(i + ivec2(0, 1), ivec2(0), last), 0).xy * pc.mv_to_px;
+        cand[4] = texelFetch(mv, clamp(i + ivec2(1, 1), ivec2(0), last), 0).xy * pc.mv_to_px;
+        cand[5] = vec2(0.0);
+        for (int k = 0; k < 6; k++)
+            try_vector(q, cand[k], k == 0 ? 0.0 : k < 5 ? 0.04 : 0.08);
     } else {
         try_vector(q, vec2(0.0), 0.0);
     }
     mediump vec3 d = abs(a.rgb - b.rgb);
     mediump float w = flow ? smoothstep(0.08, 0.25, max(d.r, max(d.g, d.b))) : 0.0;
-    mediump vec4 nearer = pc.t < 0.5 ? a : b;
-    imageStore(dst, p, uvec4(pack(mix(mix(a, b, pc.t), nearer, w))));
+    mediump vec4 alone = pc.t < 0.5 ? a : b;
+    if (w > 0.0) {
+        // background: the candidate nearest the mean motion; figure: the one farthest from it
+        vec2 mean = vec2(cut.sum) / (16.0 * float(grid.x * grid.y)) * pc.mv_to_px;
+        vec2 vb = cand[0], vf = cand[0];
+        for (int k = 1; k < 6; k++)
+            if (distance(cand[k], mean) < distance(vb, mean))
+                vb = cand[k];
+        for (int k = 0; k < 6; k++)
+            if (distance(cand[k], vb) > distance(vf, vb))
+                vf = cand[k];
+        if (distance(vf, vb) > 1.0)
+            alone = uncovered(q, vb, vf, alone);
+    }
+    imageStore(dst, p, uvec4(pack(mix(mix(a, b, pc.t), alone, w))));
 }
