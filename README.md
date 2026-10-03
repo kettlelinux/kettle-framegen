@@ -119,6 +119,7 @@ example `KETTLE_FG_MULTIPLIER=3`) overrides the file.
 | `fifo` | `true` | Force FIFO presentation, also for games that pick a present mode per frame (DXVK, vkd3d-proton). Read when the swapchain is created. |
 | `preserve_images` | `false` | Add no extra swapchain images. Read when the swapchain is created. |
 | `stats` | `false` | Log GPU time per stage every 2 seconds. |
+| `latency` | `normal` | `low` holds the game until its previous frame is on screen (below). |
 | `dump` | unset | Directory to save the next generated frames to, for debugging. |
 
 With FIFO, frames are shown evenly only when the game renders fast enough to fill every refresh
@@ -137,6 +138,15 @@ Set `refresh` for `auto`. Without it, the layer takes the display as full when t
 for it and measures the refresh rate there, but a GPU-bound game also waits short of full, so
 `auto` can settle too low; with a frame limiter between the layer and the display, it measures
 the limit.
+
+Generated frames between two real ones need the later one rendered, so the game always runs a
+frame ahead of the display. Any further and its frames wait in the swapchain's queue, which is
+input latency. With `latency = low`, after each of the game's frames the layer waits until the
+previous one is on screen, so the game starts its next frame that much later and closer to
+being shown. It needs `VK_KHR_present_wait` (RADV, Turnip and PanVK have it; the layer turns it
+on). Many games already keep their own queue short (vkd3d-proton and DXVK do), and at a full
+display the layer's own wait for spare images does too, so `stats` logs how often the previous
+frame wasn't shown yet: near 0%, `low` changes nothing.
 
 The layer logs to stderr with the prefix `VK_LAYER_KETTLE_framegen:`.
 
