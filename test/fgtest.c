@@ -407,7 +407,7 @@ static void run_create(struct run *R, VkExtent2D full, float flow_scale)
         R->ds_still[c] = ds_make(R, P_STILL, (VkImageView[]){ R->hist[p].view, R->hist[c].view, R->still.view });
         for (int k = 0; k < MAX_GEN; k++)
             R->ds_synth[c][k] = ds_make(R, P_SYNTH, (VkImageView[]){ R->hist[p].view, R->hist[c].view,
-                                                                     R->mvf[c].view, R->out[k].view, NULL,
+                                                                     R->mvf[c].view, R->out[k].view, VK_NULL_HANDLE,
                                                                      R->still.view });
     }
     VkCommandBufferAllocateInfo cai = { .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO,

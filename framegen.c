@@ -821,7 +821,7 @@ static bool flow_build(struct swapchain *sc, float flow_scale)
         ok = ok && (sc->ds_still[c] = ds_make(sc, P_STILL, (VkImageView[]){ sc->hist[p].view, sc->hist[c].view, sc->still.view }));
         for (int k = 0; k < MAX_GEN; k++)
             ok = ok && (sc->ds_synth[c][k] = ds_make(sc, P_SYNTH, (VkImageView[]){
-                            sc->hist[p].view, sc->hist[c].view, sc->mvf[c].view, sc->out[k].view, NULL, sc->still.view }));
+                            sc->hist[p].view, sc->hist[c].view, sc->mvf[c].view, sc->out[k].view, VK_NULL_HANDLE, sc->still.view }));
         if (!ok)
             return false;
     }
