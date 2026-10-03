@@ -9,9 +9,10 @@
 // can't pick a vector its neighbourhood disagrees with (lone specks).
 // HUDs stay put over a moving scene: a pixel the same in both frames, with its left and right
 // neighbours, is still and kept as it is (any vector landing on flat HUD colour in both frames
-// would match it as well), and a moving vector whose sample lands on the HUD (still.comp's
-// mask) is passed over, as the scene doesn't move through the HUD (copies of HUD text dragged
-// across the scene otherwise).
+// would match it as well), and a moving vector whose sample lands on anything still
+// (still.comp's mask: the HUD, black bars, a figure the camera keeps still) is passed over, as
+// the scene doesn't move through it (copies of HUD text dragged across the scene, or black bars
+// bleeding into a loading video, otherwise).
 // Where even the best vector leaves the frames disagreeing, the pixel is occluded in one of
 // them or the motion is wrong, and blending would show both images. Where two motions meet,
 // it is background that a figure in front covers in one frame (the halo around a character
@@ -39,7 +40,7 @@ layout(binding = 4) readonly buffer Cut {
     uint bad_blocks;
     ivec2 sum;  // vectors, level-0 pixels in 1/16ths
 } cut;
-layout(binding = 5) uniform sampler2D hud;  // still.comp: 1 on still detail
+layout(binding = 5) uniform sampler2D hud;  // still.comp: 1 where the frames are the same
 
 const float LOST_FROM = 0.02, LOST_TO = 0.04;  // block match cost: motion followed .. lost
 
@@ -101,7 +102,9 @@ void try_vector(vec2 q, vec2 v, mediump float bias)
             c += 1.0;  // a moving vector on the HUD
     } else {
         // one side has left the frame: nothing to check against, so only take this
-        // vector when nothing that can be checked fits
+        // vector when nothing that can be checked fits, and never from the HUD
+        if (dot(v, v) > 2.25 && on_hud(ina ? qa : qb))
+            return;
         if (ina)
             pb = pa;
         else
