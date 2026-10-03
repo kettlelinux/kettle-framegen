@@ -35,7 +35,8 @@
 #define EXPORT __attribute__((visibility("default")))
 #define LAYER "VK_LAYER_KETTLE_framegen"
 #define KEY(h) (*(void **)(h))
-#define MAX_GEN 2          // generated frames per rendered one (3x); beyond it, too few real frames
+#define MAX_GEN 2
+#define MAX_BURST 16          // generated frames per rendered one (3x); beyond it, too few real frames
 #define RING 3             // presents in flight
 #define MAX_QUEUES 64
 // GPU timestamps per present: start, then the end of each stage
@@ -75,6 +76,7 @@ struct config {
     bool stats;            // log GPU time every 2 s
     bool low_latency;      // "latency = low": hold the game until its previous frame is shown
     char dump[512];        // save the next generated frames here ("dump = <dir>", see dump())
+    int burst;             // "burst = <n>": instead, the next n real frames in a row (see burst())
     unsigned dump_serial;  // counts file loads that asked for a dump
 };
 
@@ -109,6 +111,8 @@ static void config_set(struct config *c, const char *k, const char *v)
         c->low_latency = !strcasecmp(v, "low");
     else if (!strcmp(k, "stats"))
         c->stats = parse_bool(v);
+    else if (!strcmp(k, "burst"))
+        c->burst = atoi(v);
     else if (!strcmp(k, "dump"))
         snprintf(c->dump, sizeof(c->dump), "%s", v);
 }
@@ -364,6 +368,15 @@ struct swapchain {
     // tried (without waiting) every 10 s from probe_at
     uint32_t gen_limit;
     unsigned dump_serial;  // last config dump request served
+    struct {               // burst(): a run of real frames being captured
+        uint32_t n, i;
+        char dir[512];
+        VkBuffer buf;
+        VkDeviceMemory mem;
+        uint32_t *px;
+        VkCommandBuffer cmd[MAX_BURST];
+        VkFence fence[MAX_BURST];
+    } burst;
     double probe_at;
     // Created on the first present (they need the present queue's family): the frame ring,
     // kept for the swapchain's life since presents wait on its semaphores, and the flow
@@ -696,6 +709,8 @@ static void sc_idle(struct swapchain *sc)
     }
 }
 
+static void burst_free(struct swapchain *sc);
+
 static void ring_free(struct swapchain *sc)
 {
     struct dev *d = sc->dev;
@@ -715,6 +730,8 @@ static void ring_free(struct swapchain *sc)
         if (sc->present_sems[i])
             d->DestroySemaphore(dev, sc->present_sems[i], NULL);
     memset(sc->present_sems, 0, sc->nimages * sizeof(*sc->present_sems));
+    if (sc->burst.buf || sc->burst.cmd[0])
+        burst_free(sc);
     if (sc->pool)
         d->DestroyCommandPool(dev, sc->pool, NULL);
     if (sc->queries)
@@ -1060,6 +1077,139 @@ static void record(struct swapchain *sc, VkCommandBuffer cmd, int slot, uint32_t
     d->EndCommandBuffer(cmd);
 }
 
+static void write_ppm(struct swapchain *sc, const char *path, const uint32_t *p)
+{
+    uint32_t w = sc->extent.width, h = sc->extent.height;
+    bool ten = sc->hist_format == VK_FORMAT_A2B10G10R10_UNORM_PACK32;
+    FILE *o = fopen(path, "wb");
+    if (!o)
+        return;
+    fprintf(o, "P6\n%u %u\n255\n", w, h);
+    for (size_t j = 0; j < (size_t)w * h; j++) {
+        uint32_t v = p[j];
+        uint8_t c[3] = { v, v >> 8, v >> 16 };
+        if (ten)
+            c[0] = (v & 1023) >> 2, c[1] = ((v >> 10) & 1023) >> 2, c[2] = ((v >> 20) & 1023) >> 2;
+        if (sc->bgr) {
+            uint8_t t = c[0];
+            c[0] = c[2];
+            c[2] = t;
+        }
+        fwrite(c, 1, 3, o);
+    }
+    fclose(o);
+}
+
+static void burst_free(struct swapchain *sc)
+{
+    struct dev *d = sc->dev;
+    VkDevice dev = d->handle;
+    for (uint32_t i = 0; i < MAX_BURST; i++) {
+        if (sc->burst.fence[i]) {
+            d->WaitForFences(dev, 1, &sc->burst.fence[i], VK_TRUE, UINT64_MAX);
+            d->DestroyFence(dev, sc->burst.fence[i], NULL);
+        }
+        if (sc->burst.cmd[i])
+            d->FreeCommandBuffers(dev, sc->pool, 1, &sc->burst.cmd[i]);
+    }
+    if (sc->burst.buf)
+        d->DestroyBuffer(dev, sc->burst.buf, NULL);
+    if (sc->burst.mem)
+        d->FreeMemory(dev, sc->burst.mem, NULL);  // unmaps
+    memset(&sc->burst, 0, sizeof(sc->burst));
+}
+
+// Debugging: n real frames in a row go to <dir>/kettle-fg-real-<present>.ppm, for test cases
+// with the truth for a generated frame (every other real frame, generated from the two around
+// it). Copied on the GPU as they come and written out after the last, so the game isn't held
+// up between them (a game moving things by the time that passed would show a stall as a jump).
+static void burst_start(struct swapchain *sc, uint32_t n, const char *dir)
+{
+    struct dev *d = sc->dev;
+    VkDevice dev = d->handle;
+    if (n > MAX_BURST)
+        n = MAX_BURST;
+    VkDeviceSize one = (VkDeviceSize)sc->extent.width * sc->extent.height * 4;
+    VkBufferCreateInfo bci = {
+        .sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO,
+        .size = one * n,
+        .usage = VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+    };
+    VkMemoryRequirements req;
+    const VkMemoryPropertyFlags host = VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT;
+    snprintf(sc->burst.dir, sizeof(sc->burst.dir), "%s", dir);
+    if (d->CreateBuffer(dev, &bci, NULL, &sc->burst.buf) != VK_SUCCESS)
+        goto fail;
+    d->GetBufferMemoryRequirements(dev, sc->burst.buf, &req);
+    VkMemoryAllocateInfo ai = { .sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO, .allocationSize = req.size,
+                                .memoryTypeIndex = UINT32_MAX };
+    for (uint32_t i = 0; i < d->mem.memoryTypeCount && ai.memoryTypeIndex == UINT32_MAX; i++)
+        if ((req.memoryTypeBits & (1u << i)) && (d->mem.memoryTypes[i].propertyFlags & host) == host)
+            ai.memoryTypeIndex = i;
+    if (ai.memoryTypeIndex == UINT32_MAX || d->AllocateMemory(dev, &ai, NULL, &sc->burst.mem) != VK_SUCCESS ||
+        d->BindBufferMemory(dev, sc->burst.buf, sc->burst.mem, 0) != VK_SUCCESS ||
+        d->MapMemory(dev, sc->burst.mem, 0, VK_WHOLE_SIZE, 0, (void **)&sc->burst.px) != VK_SUCCESS)
+        goto fail;
+    VkCommandBufferAllocateInfo cai = {
+        .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO,
+        .commandPool = sc->pool,
+        .level = VK_COMMAND_BUFFER_LEVEL_PRIMARY,
+        .commandBufferCount = 1,
+    };
+    VkFenceCreateInfo fi = { .sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO };
+    for (uint32_t i = 0; i < n; i++)
+        if (d->AllocateCommandBuffers(dev, &cai, &sc->burst.cmd[i]) != VK_SUCCESS ||
+            d->set_loader_data(dev, sc->burst.cmd[i]) != VK_SUCCESS ||
+            d->CreateFence(dev, &fi, NULL, &sc->burst.fence[i]) != VK_SUCCESS)
+            goto fail;
+    sc->burst.n = n;
+    return;
+fail:
+    say("burst of %u frames to %s: out of memory", n, dir);
+    burst_free(sc);
+}
+
+// The frame just rendered (hist[cur], written by commands already submitted to this queue)
+static void burst_capture(struct swapchain *sc, VkQueue queue)
+{
+    struct dev *d = sc->dev;
+    uint32_t i = sc->burst.i, w = sc->extent.width, h = sc->extent.height;
+    VkCommandBuffer cmd = sc->burst.cmd[i];
+    VkCommandBufferBeginInfo bi = {
+        .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO,
+        .flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT,
+    };
+    d->BeginCommandBuffer(cmd, &bi);
+    barrier(d, cmd, VK_PIPELINE_STAGE_TRANSFER_BIT | VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+            VK_ACCESS_TRANSFER_WRITE_BIT | VK_ACCESS_SHADER_WRITE_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT,
+            VK_ACCESS_TRANSFER_READ_BIT);
+    VkBufferImageCopy r = {
+        .bufferOffset = (VkDeviceSize)w * h * 4 * i,
+        .imageSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 },
+        .imageExtent = { w, h, 1 },
+    };
+    d->CmdCopyImageToBuffer(cmd, sc->hist[sc->cur].image, VK_IMAGE_LAYOUT_GENERAL, sc->burst.buf, 1, &r);
+    barrier(d, cmd, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_TRANSFER_WRITE_BIT, VK_PIPELINE_STAGE_HOST_BIT,
+            VK_ACCESS_HOST_READ_BIT);
+    d->EndCommandBuffer(cmd);
+    VkSubmitInfo si = { .sType = VK_STRUCTURE_TYPE_SUBMIT_INFO, .commandBufferCount = 1, .pCommandBuffers = &cmd };
+    if (d->QueueSubmit(queue, 1, &si, sc->burst.fence[i]) != VK_SUCCESS) {
+        burst_free(sc);
+        return;
+    }
+    if (++sc->burst.i < sc->burst.n)
+        return;
+    d->WaitForFences(d->handle, sc->burst.n, sc->burst.fence, VK_TRUE, UINT64_MAX);
+    for (uint32_t k = 0; k < sc->burst.n; k++) {
+        char path[1100];
+        snprintf(path, sizeof(path), "%s/kettle-fg-real-%llu.ppm", sc->burst.dir,
+                 (unsigned long long)(sc->count - sc->burst.n + 1 + k));
+        write_ppm(sc, path, sc->burst.px + (size_t)w * h * k);
+    }
+    say("captured %u real frames in a row to %s", sc->burst.n, sc->burst.dir);
+    burst_free(sc);
+}
+
 // Debugging: the previous frame, the generated ones and the current frame go to
 // <dir>/kettle-fg-<present>-<i>.ppm. Taken at present KETTLE_FG_DUMP_FRAME (default 300) with
 // KETTLE_FG_DUMP=<dir>, or at the next present after the game's settings file gains (or is
@@ -1137,28 +1287,10 @@ static void dump(struct swapchain *sc, struct frame *f, VkQueue queue, uint32_t 
         goto out;
     d->WaitForFences(dev, 1, &fence, VK_TRUE, UINT64_MAX);
 
-    bool ten = sc->hist_format == VK_FORMAT_A2B10G10R10_UNORM_PACK32;
     for (uint32_t i = 0; i < n; i++) {
         char path[1100];
         snprintf(path, sizeof(path), "%s/kettle-fg-%llu-%u.ppm", dir, (unsigned long long)sc->count, i);
-        FILE *o = fopen(path, "wb");
-        if (!o)
-            continue;
-        fprintf(o, "P6\n%u %u\n255\n", w, h);
-        const uint32_t *p = px + (size_t)w * h * i;
-        for (size_t j = 0; j < (size_t)w * h; j++) {
-            uint32_t v = p[j];
-            uint8_t c[3] = { v, v >> 8, v >> 16 };
-            if (ten)
-                c[0] = (v & 1023) >> 2, c[1] = ((v >> 10) & 1023) >> 2, c[2] = ((v >> 20) & 1023) >> 2;
-            if (sc->bgr) {
-                uint8_t t = c[0];
-                c[0] = c[2];
-                c[2] = t;
-            }
-            fwrite(c, 1, 3, o);
-        }
-        fclose(o);
+        write_ppm(sc, path, px + (size_t)w * h * i);
     }
     say("dumped %u frames of present %llu to %s (%u of %u blocks unmatched)", n, (unsigned long long)sc->count, dir,
         px[(size_t)w * h * n], sc->mv[0].width * sc->mv[0].height);
@@ -1533,8 +1665,15 @@ static VkResult present_frames(VkQueue queue, const VkPresentInfoKHR *pi, struct
     }
     if (ngen && c.dump[0] && c.dump_serial != sc->dump_serial) {
         sc->dump_serial = c.dump_serial;
-        dump(sc, f, queue, ngen, c.dump);
+        if (c.burst > 0) {
+            if (!sc->burst.n)
+                burst_start(sc, c.burst, c.dump);
+        } else {
+            dump(sc, f, queue, ngen, c.dump);
+        }
     }
+    if (sc->burst.n)
+        burst_capture(sc, queue);
 
     for (uint32_t k = 0; k < ngen; k++)
         present_image(sc, queue, acq[k], sc->present_sems[acq[k]]);

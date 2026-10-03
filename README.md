@@ -93,7 +93,10 @@ either to some cases.
 The synthetic cases come from `test/make-cases.py`. To add a case from a game, set `dump` (see
 below) and copy the first and last frame of the dump to a new case as `0.ppm` and `1.ppm`, with
 `multiplier` set to the number of frames the dump holds minus one; then `make test-update
-CASES=test/cases/<name>`.
+CASES=test/cases/<name>`. For a case with a truth, set `burst = 8` with `dump`: the next 8 real
+frames in a row are saved, and every other one is the truth for a frame generated between its
+neighbours (`0.ppm`, `1.ppm`, ... from frames 0, 2, 4, ... and `truth/1-1.ppm`, ... from 1, 3,
+...). The motion between them is twice the game's, so they are harder than the game itself.
 
 ## Using it
 
@@ -130,6 +133,7 @@ example `KETTLE_FG_MULTIPLIER=3`) overrides the file.
 | `stats` | `false` | Log GPU time per stage every 2 seconds. |
 | `latency` | `normal` | `low` holds the game until its previous frame is on screen (below). |
 | `dump` | unset | Directory to save the next generated frames to, for debugging. |
+| `burst` | `0` | With `dump`: save this many real frames in a row instead (up to 16). |
 
 With FIFO, frames are shown evenly only when the game renders fast enough to fill every refresh
 with the multiplier: a 45 fps game at 2x on a 120 Hz display shows each generated frame for one
