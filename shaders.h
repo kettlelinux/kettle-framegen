@@ -7,12 +7,13 @@
 #include "down.spv.h"
 #include "motion.spv.h"
 #include "filter.spv.h"
+#include "still.spv.h"
 #include "synth.spv.h"
 
 #define MAX_LEVELS 7
 #define BLOCK 8  // motion block size, pixels (motion.comp B)
 
-enum { P_LUMA, P_DOWN, P_MOTION, P_FILTER, P_SYNTH, NPIPE };
+enum { P_LUMA, P_DOWN, P_MOTION, P_FILTER, P_STILL, P_SYNTH, NPIPE };
 #define PUSH_SIZE 32
 
 #define S VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER
@@ -22,13 +23,14 @@ static const struct pipe_spec {
     const uint32_t *code;
     size_t size;
     uint32_t n;
-    VkDescriptorType types[5];
+    VkDescriptorType types[6];
 } pipe_specs[NPIPE] = {
     [P_LUMA] = { spv_luma0, sizeof(spv_luma0), 2, { S, W } },
     [P_DOWN] = { spv_down, sizeof(spv_down), 2, { S, W } },
     [P_MOTION] = { spv_motion, sizeof(spv_motion), 5, { S, S, S, S, W } },
     [P_FILTER] = { spv_filter, sizeof(spv_filter), 3, { S, W, B } },
-    [P_SYNTH] = { spv_synth, sizeof(spv_synth), 5, { S, S, S, W, B } },
+    [P_STILL] = { spv_still, sizeof(spv_still), 3, { S, S, W } },
+    [P_SYNTH] = { spv_synth, sizeof(spv_synth), 6, { S, S, S, W, B, S } },
 };
 #undef S
 #undef W

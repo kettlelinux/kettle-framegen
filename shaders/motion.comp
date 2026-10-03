@@ -102,7 +102,7 @@ void main()
         return;
     }
 
-    int r = pc.coarsest != 0 ? 3 : 1;
+    int r = pc.coarsest != 0 ? 5 : 1;
     vec2 center = best;
     for (int y = -r; y <= r; y++)
         for (int x = -r; x <= r; x++)

@@ -13,7 +13,7 @@ PREFIX ?= /usr
 LIBDIR ?= $(PREFIX)/lib
 LIB32DIR ?= $(PREFIX)/lib32
 LAYERDIR := $(PREFIX)/share/vulkan/implicit_layer.d
-SHADERS := luma0 down motion filter synth
+SHADERS := luma0 down motion filter still synth
 HEADERS := $(SHADERS:%=build/%.spv.h)
 LIB := build/libVkLayer_kettle_framegen.so
 LIB32 := build/32/libVkLayer_kettle_framegen.so
