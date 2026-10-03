@@ -206,9 +206,13 @@ void main()
         // where the blocks around matched poorly (mean luma difference about 0.01 where they
         // do, 0.08 counts as unmatched): one poor block is the edge of a moving figure, which
         // the vectors below handle, but a whole region is motion they don't follow. And the
-        // more of the frame is lost (a camera whipping round), the sooner (from 15% of blocks
-        // unmatched, all of it: the frame is a real one shown again)
-        scale = 1.0 - smoothstep(0.06, 0.15, float(cut.bad_blocks) / float(grid.x * grid.y));
+        // more of the frame is lost (a camera whipping round), the sooner (from 30% of blocks
+        // unmatched, all of it: the frame is a real one shown again). Not from fewer: in a fast
+        // turn in Skyrim 10-25% of blocks go unmatched (the strips beside a sword and the hand,
+        // foliage), and showing the nearer frame across all of it put the whole scene where
+        // that frame had it while those that matched were in between (measured against the
+        // real frames in between: half the error at 25%)
+        scale = 1.0 - smoothstep(0.15, 0.3, float(cut.bad_blocks) / float(grid.x * grid.y));
         lost = scale > 0.0 ? smoothstep(LOST_FROM * scale, LOST_TO * scale, matched) : 1.0;
         for (int k = 0; k < 4; k++) {
             vec4 m = texelFetch(mv, clamp(i + ivec2(k & 1, k >> 1), ivec2(0), last), 0);

@@ -20,7 +20,7 @@ no image is shared between devices. On each `vkQueuePresentKHR` the layer:
 Where the motion is lost, because the camera turns faster than the search reaches (about 160
 pixels per frame at 3440x1440), a generated frame shows the nearer real frame again: in the
 regions whose blocks all match poorly, and in the whole frame once enough of its blocks are
-unmatched (from 6%, fully at 15%), as at a scene cut. That is briefly uneven, but cleaner than
+unmatched (from 15%, fully at 30%), as at a scene cut. That is briefly uneven, but cleaner than
 a patchwork of half-fitting vectors.
 
 Swapchains get up to 2 extra images for the generated frames, so the highest multiplier is 3x.
