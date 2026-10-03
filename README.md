@@ -164,7 +164,9 @@ The layer logs to stderr with the prefix `VK_LAYER_KETTLE_framegen:`.
 While a game runs, `$XDG_RUNTIME_DIR/kettle-framegen/<pid>` holds the multiplier in use as
 `multiplier=<n>` (the one `auto` picked, or the setting; `1` while generation is off), for tools
 that show it. The layer rewrites it when the multiplier changes and removes it when the game exits
-normally.
+normally. It is the game's own runtime directory: in a container such as Steam's pressure-vessel
+(Proton) that is not the host's, so read it as `/proc/<pid>/root/$XDG_RUNTIME_DIR/...`, with the
+game's `XDG_RUNTIME_DIR`.
 
 ## License
 
