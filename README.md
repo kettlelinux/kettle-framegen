@@ -127,8 +127,8 @@ holds the game at refresh / multiplier (45 fps here). Whether the game could fil
 less doesn't show while it is held, so the layer tries one less now and then: it keeps it if
 the display still fills, and otherwise goes back (a second or two of judder) and doubles the
 wait before the next try, up to 5 minutes. A raise that shows no more frames than before (4x
-can run short of swapchain images) is undone and not retried for a minute. The log shows each
-change.
+can run short of swapchain images) is undone and not retried for 10 seconds, doubling while it
+keeps failing. The log shows each change.
 
 Set `refresh` for `auto`. Without it, the layer takes the display as full when the game waits
 for it and measures the refresh rate there, but a GPU-bound game also waits short of full, so

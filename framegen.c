@@ -40,9 +40,9 @@
 // GPU timestamps per present: start, then the end of each stage
 enum { TS_START, TS_PYRAMID, TS_MOTION, TS_SYNTH, TS_OUTPUT, NTS };
 #define ACQUIRE_TIMEOUT 100000000ull  // ns
-#define PACE_TRY 10.0       // s: multiplier = auto tries one less this long after a change...
-#define PACE_TRY_MAX 300.0  // ...doubling after each try that didn't hold, up to this
-#define PACE_CAP 60.0       // s: a multiplier that showed no more frames than the one below isn't retried
+#define PACE_TRY 10.0       // s: multiplier = auto tries one less this long after a change, and
+                            // doesn't raise past a raise that showed no more frames for this long...
+#define PACE_TRY_MAX 300.0  // ...doubling after each failure, up to this
 
 static void say(const char *fmt, ...)
 {
@@ -284,10 +284,10 @@ struct pacing {
     double hz_shown, hz_t;  // decayed sums over windows FIFO held back; their ratio is the refresh rate
     double down_at, down_wait;  // next try at n - 1, and the wait after that
     bool trying;            // n - 1 is being tried
-    double up_shown;        // after a raise: frames shown per second before it, else 0
+    double up_fps;          // after a raise: rendered fps before it, else 0
     int up_from, cap;       // ...and the multiplier before it; the highest allowed until cap_until
-    int up_short;           // windows since the raise that showed no more frames
-    double cap_until;
+    int up_short;           // windows since the raise that fell short
+    double cap_until, cap_wait;  // ...and how long the next failed raise caps it
 };
 
 struct frame {  // one present in flight
@@ -1152,15 +1152,16 @@ static void stats(struct swapchain *sc, int slot, int multiplier)
 // the refresh rate is the rate frames are shown at while the game waits for the display, and
 // the display is full when the game waits for it, which a GPU-bound game also does short of
 // full (the compositor hands images back only once the GPU is done with them).
-// A raise that shows no more frames than before only costs rendered ones (4x can run out of
-// swapchain images to queue its frames in), so it is undone and not repeated for a while.
+// A raise that falls well short of the frames it should show (the rendered rate before it times
+// the new multiplier, at most the refresh rate) costs rendered frames for little (4x can run out
+// of swapchain images to queue its frames in), so it is undone and not repeated for a while.
 static int pace(struct swapchain *sc, double t, float refresh)
 {
     struct pacing *p = &sc->pace;
     if (!p->n) {
         p->n = 2;
         p->win_t = t;
-        p->down_wait = PACE_TRY;
+        p->down_wait = p->cap_wait = PACE_TRY;
         p->down_at = t + p->down_wait;
     }
     double dt = t - p->win_t;
@@ -1178,17 +1179,25 @@ static int pace(struct swapchain *sc, double t, float refresh)
     bool held = refresh > 0 ? shown >= 0.95 * refresh : waited > 0.02 * dt;
     int n = p->n, top = t < p->cap_until ? p->cap : MAX_GEN + 1;
     bool judged = !p->settle && dt < 1.5;
-    bool short_of = p->up_shown > 0 && shown < 1.03 * p->up_shown;
+    double due = p->up_fps * n;
+    if (hz > 0)
+        due = fmin(due, hz);
+    bool short_of = p->up_fps > 0 && shown < 0.9 * due;
     p->settle = false;
     if (!judged) {
         // n just changed, so the window shows neither, or the game stalled (loading, hidden)
     } else if (short_of && ++p->up_short < 2) {
         // the queue may still be filling after the raise: judge the next window too
     } else if (short_of) {
-        say("auto multiplier %dx shows no more frames than %dx (%.1f per second)", n, p->up_from, shown);
-        n = p->cap = p->up_from;
-        p->cap_until = t + PACE_CAP;
-        p->up_shown = 0;
+        say("auto multiplier %dx shows %.1f frames per second of %.1f, back to %dx, not again for %.0f s", n,
+            shown, due, p->up_from, p->cap_wait);
+        // the game may just have slowed at the same time: a short cap at first, longer
+        // when the same raise keeps failing (4x short of swapchain images)
+        p->cap = n - 1;
+        n = p->up_from;
+        p->cap_until = t + p->cap_wait;
+        p->cap_wait = fmin(2.0 * p->cap_wait, PACE_TRY_MAX);
+        p->up_fps = 0;
         p->trying = false;
     } else if (held) {
         if (p->trying) {
@@ -1208,14 +1217,17 @@ static int pace(struct swapchain *sc, double t, float refresh)
         // a little short of the refresh rate is close enough to fill it
         int want = hz > 0 ? (int)ceil(hz / fps - 0.03) : n + 1;
         if (want > n && n < top) {
-            p->up_shown = shown;
+            p->up_fps = fps;
             p->up_from = n;
             p->up_short = 0;
             n = want < top ? want : top;
         }
     }
-    if (judged && n == p->n && !(short_of && p->up_short < 2))
-        p->up_shown = 0;  // the raise was judged (or there was none)
+    if (judged && n == p->n && !(short_of && p->up_short < 2)) {
+        if (p->up_fps > 0)
+            p->cap_wait = PACE_TRY;  // the raise delivered
+        p->up_fps = 0;               // the raise was judged (or there was none)
+    }
     if (n != p->n) {
         char rate[16] = "unknown";
         if (hz > 0)
