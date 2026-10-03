@@ -184,6 +184,7 @@ void main()
     mean = vec2(cut.sum) / (16.0 * float(grid.x * grid.y)) * pc.mv_to_px;
     vec2 cand[6];  // the block field here, the four nearest blocks, zero
     mediump float cost[6];
+    float spread = 0.0;  // how far apart the nearest blocks' vectors are from the field here
     float matched = 1.0;  // the best match cost around (filter.comp: of 3x3 blocks), interpolated
     vec2 rcp = 1.0 / pc.size, dx = vec2(1.0, 0.0);
     mediump vec4 sa = textureLod(prev_img, q * rcp, 0.0), sb = textureLod(cur_img, q * rcp, 0.0);
@@ -212,7 +213,14 @@ void main()
         for (int k = 0; k < 4; k++) {
             vec4 m = texelFetch(mv, clamp(i + ivec2(k & 1, k >> 1), ivec2(0), last), 0);
             cand[k + 1] = m.xy * pc.mv_to_px;
+            spread = max(spread, distance(cand[k + 1], cand[0]));
         }
+        // where two motions meet (a figure's edge), poor matches are the background one frame
+        // shows and the other doesn't, which the occlusion handling below fills, not motion
+        // lost: in a fast turn that strip is wider than the blocks around that the fallback
+        // judges by, and showing the nearer frame there put the background beside a sword
+        // where that frame had it (a halo growing with the speed)
+        lost *= 1.0 - smoothstep(EDGE, 2.0 * EDGE, spread);
         cand[5] = vec2(0.0);
         for (int k = 0; k < 6; k++)
             cost[k] = try_vector(q, cand[k], k == 0 ? 0.0 : k < 5 ? 0.04 : 0.08);
@@ -258,9 +266,6 @@ void main()
             vec2 v0 = cand[0];
             mediump vec4 along = pc.t < 0.5 ? textureLod(prev_img, (q - pc.t * v0) * rcp, 0.0)
                                             : textureLod(cur_img, (q + (1.0 - pc.t) * v0) * rcp, 0.0);
-            float spread = 0.0;
-            for (int k = 1; k < 5; k++)
-                spread = max(spread, distance(cand[k], v0));
             if (spread > EDGE) {
                 mediump vec4 edge = along;
                 mediump float edge_cost = 1e4;
