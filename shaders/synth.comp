@@ -2,7 +2,8 @@
 // One generated frame at time t between the previous (0) and current (1) frame.
 // Each pixel follows a motion vector back into the previous frame and forward into the current
 // one and blends the two by t. The vector is picked per pixel: the block field interpolated
-// here, the four nearest block vectors, or zero, whichever makes the two frames agree best
+// here, the four nearest block vectors, or zero (where none fits, blocks a little further off
+// too), whichever makes the two frames agree best
 // (with a small bias to the interpolated one). That keeps motion edges sharp where interpolated
 // vectors would mix two motions, and static overlays (HUDs) still where their block moves.
 // Agreement is measured over the pixel and the better of its left and right neighbours, so a
@@ -59,6 +60,8 @@ layout(binding = 5) uniform sampler2D hud;  // still.comp: 1 where the frames ar
 const float LOST_FROM = 0.02, LOST_TO = 0.04;  // block match cost: motion followed .. lost
 const float UNMATCHED = 0.06;  // block match cost from which its vectors are no use at all
 const float EDGE = 4.0;        // block vectors this far apart (pixels): a figure's edge
+const int NC = 14;             // candidate vectors: here, the 4 nearest blocks, zero, 8 further off
+const mediump float POOR = 0.5;  // the best match cost from which those further off are tried
 
 layout(push_constant) uniform PC {
     vec2 size;      // frame, pixels
@@ -179,7 +182,8 @@ bool uncovered(vec2 q, vec2 vb, vec2 vf, out mediump vec4 shown)
 bool covers(vec2 q, vec2 vb, vec2 vf, out mediump vec4 shown)
 {
     vec2 r = vb - vf;
-    vec2 d = normalize(r) * max(8.0, 0.5 * length(r));
+    // past the block at the figure's edge, whose vector is neither's
+    vec2 d = normalize(r) * max(1.5 * pc.size.x / float(textureSize(mv, 0).x), 0.5 * length(r));
     vec2 c = q - (pc.t - 0.5) * vf;  // the field has the figure where it is at t = 0.5
     float ahead = distance(textureLod(mv, (c + d) * pc.mv_uv, 0.0).xy * pc.mv_to_px, vf);
     float behind = distance(textureLod(mv, (c - d) * pc.mv_uv, 0.0).xy * pc.mv_to_px, vf);
@@ -209,8 +213,8 @@ void main()
         return;
     }
     mean = vec2(cut.sum) / (16.0 * float(grid.x * grid.y)) * pc.mv_to_px;
-    vec2 cand[6];  // the block field here, the four nearest blocks, zero
-    mediump float cost[6];
+    vec2 cand[NC];  // the block field here, the four nearest blocks, zero, blocks further off
+    mediump float cost[NC];
     float spread = 0.0;  // how far apart the nearest blocks' vectors are from the field here
     float matched = 1.0;  // the best match cost around (filter.comp: of 3x3 blocks), interpolated
     vec2 rcp = 1.0 / pc.size, dx = vec2(1.0, 0.0);
@@ -255,6 +259,25 @@ void main()
         cand[5] = vec2(0.0);
         for (int k = 0; k < 6; k++)
             cost[k] = try_vector(q, cand[k], k == 0 ? 0.0 : k < 5 ? 0.04 : 0.08);
+        // Beside a figure, the blocks at its edge take its vector (most of their pixels are
+        // the figure's), so the nearest four can all be the figure's and the background there
+        // has no vector of its own: interpolated with the figure's, it shows both frames at
+        // once (a ghosted strip along a sword as the camera turns, as wide as its motion).
+        // Where nothing fits, the blocks one and two beyond the nearest on each side are tried
+        // too. That is a few percent of the pixels (in Skyrim 4-8%, along figures and in
+        // foliage), so the cost stays small.
+        for (int k = 6; k < NC; k++) {
+            cand[k] = cand[0];
+            cost[k] = 1e4;
+        }
+        if (best > POOR) {
+            for (int k = 6; k < NC; k++) {
+                int r = (k - 6) / 4 + 1, j = (k - 6) % 4;  // one block further off, then two
+                ivec2 o = ivec2(j == 0 ? -r : j == 1 ? r + 1 : 0, j == 2 ? -r : j == 3 ? r + 1 : 0);
+                cand[k] = texelFetch(mv, clamp(i + o, ivec2(0), last), 0).xy * pc.mv_to_px;
+                cost[k] = try_vector(q, cand[k], 0.06);
+            }
+        }
     } else {
         try_vector(q, vec2(0.0), 0.0);
     }
@@ -264,11 +287,11 @@ void main()
     if (flow) {
         // background: the candidate nearest the mean motion; figure: the one farthest from it
         int kb = 0;
-        for (int k = 1; k < 6; k++)
+        for (int k = 1; k < NC; k++)
             if (distance(cand[k], mean) < distance(cand[kb], mean))
                 kb = k;
         vec2 vb = cand[kb], vf = cand[0];
-        for (int k = 0; k < 6; k++)
+        for (int k = 0; k < NC; k++)
             if (distance(cand[k], vb) > distance(vf, vb))
                 vf = cand[k];
         // where the background's own vector fails, it is hidden in one frame, and when the
