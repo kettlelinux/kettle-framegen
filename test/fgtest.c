@@ -194,7 +194,7 @@ static void device_init(int index)
     CHECK(vkCreateSampler(dev, &sampler_info, NULL, &sampler));
     for (int p = 0; p < NPIPE; p++) {
         const struct pipe_spec *s = &pipe_specs[p];
-        VkDescriptorSetLayoutBinding b[5];
+        VkDescriptorSetLayoutBinding b[sizeof(s->types) / sizeof(*s->types)];
         for (uint32_t i = 0; i < s->n; i++)
             b[i] = (VkDescriptorSetLayoutBinding){ i, s->types[i], 1, VK_SHADER_STAGE_COMPUTE_BIT, NULL };
         VkDescriptorSetLayoutCreateInfo lci = { .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO,
