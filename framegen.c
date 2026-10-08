@@ -321,6 +321,7 @@ struct dev {
     uint32_t nfamilies;
     float ts_period;
     VkDeviceSize atom;  // nonCoherentAtomSize
+    uint32_t wide_x;    // shaders.h: wide_group_x()
     struct { VkQueue queue; uint32_t family; } queues[MAX_QUEUES];
     uint32_t nqueues;
     // shared by all swapchains, created with the first one that needs them
@@ -575,6 +576,8 @@ static bool pipelines_create(struct dev *d)
         VkShaderModule mod;
         if (d->CreateShaderModule(d->handle, &mci, NULL, &mod) != VK_SUCCESS)
             return false;
+        VkExtent2D g = pipe_group(p, d->wide_x);
+        VkSpecializationInfo spec = { 2, group_spec_map, sizeof(g), &g };
         VkComputePipelineCreateInfo pci = {
             .sType = VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO,
             .stage = {
@@ -582,6 +585,7 @@ static bool pipelines_create(struct dev *d)
                 .stage = VK_SHADER_STAGE_COMPUTE_BIT,
                 .module = mod,
                 .pName = "main",
+                .pSpecializationInfo = s->wide ? &spec : NULL,
             },
             .layout = d->layout[p],
         };
@@ -999,7 +1003,8 @@ static void run(struct dev *d, VkCommandBuffer cmd, int pipe, VkDescriptorSet se
     d->CmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, d->layout[pipe], 0, 1, &set, 0, NULL);
     if (push_size)
         d->CmdPushConstants(cmd, d->layout[pipe], VK_SHADER_STAGE_COMPUTE_BIT, 0, push_size, push);
-    d->CmdDispatch(cmd, (size.width + 7) / 8, (size.height + 7) / 8, 1);
+    VkExtent2D g = pipe_group(pipe, d->wide_x);
+    d->CmdDispatch(cmd, (size.width + g.width - 1) / g.width, (size.height + g.height - 1) / g.height, 1);
 }
 
 static void rec_copy(struct swapchain *sc, VkCommandBuffer cmd, int slot, uint32_t ngen);
@@ -2497,6 +2502,7 @@ static VKAPI_ATTR VkResult VKAPI_CALL CreateDevice(VkPhysicalDevice phys, const 
     i->GetPhysicalDeviceProperties(phys, &props);
     d->ts_period = props.limits.timestampPeriod;
     d->atom = props.limits.nonCoherentAtomSize ? props.limits.nonCoherentAtomSize : 1;
+    d->wide_x = wide_group_x(&props.limits);
     d->key = KEY(*out);
     d->handle = *out;
     d->phys = phys;

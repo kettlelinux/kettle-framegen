@@ -4,7 +4,8 @@
 // in too, so edges between colours of the same brightness don't look flat.
 // Four bilinear taps per output texel, so downscales to ~1/4 still average every source pixel.
 #version 450
-layout(local_size_x = 8, local_size_y = 8) in;
+layout(local_size_x = 16, local_size_y = 8) in;
+layout(local_size_x_id = 0, local_size_y_id = 1) in;  // shaders.h: pipe_group()
 
 layout(binding = 0) uniform sampler2D color;
 layout(binding = 1, rgba8) uniform writeonly image2D dst;

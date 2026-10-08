@@ -55,6 +55,7 @@ static VkPipelineLayout layout[NPIPE];
 static VkPipeline pipeline[NPIPE];
 static VkCommandPool pool;
 static float ts_period;  // ns per timestamp tick, 0: the queue has no timestamps
+static uint32_t wide_x;  // shaders.h: wide_group_x()
 static int reps;         // -t: runs of each frame, 0: not timed
 
 #define CHECK(x)                                                                         \
@@ -173,6 +174,7 @@ static void device_init(int index)
     vkGetPhysicalDeviceMemoryProperties(phys, &memprops);
     printf("device: %s\n", props.deviceName);
     ts_period = props.limits.timestampPeriod;
+    wide_x = wide_group_x(&props.limits);
 
     VkQueueFamilyProperties fams[32];
     uint32_t nf = 32;
@@ -216,10 +218,13 @@ static void device_init(int index)
                                          .codeSize = s->size, .pCode = s->code };
         VkShaderModule mod;
         CHECK(vkCreateShaderModule(dev, &mci, NULL, &mod));
+        VkExtent2D g = pipe_group(p, wide_x);
+        VkSpecializationInfo spec = { 2, group_spec_map, sizeof(g), &g };
         VkComputePipelineCreateInfo cpci = {
             .sType = VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO,
             .stage = { .sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO,
-                       .stage = VK_SHADER_STAGE_COMPUTE_BIT, .module = mod, .pName = "main" },
+                       .stage = VK_SHADER_STAGE_COMPUTE_BIT, .module = mod, .pName = "main",
+                       .pSpecializationInfo = s->wide ? &spec : NULL },
             .layout = layout[p],
         };
         CHECK(vkCreateComputePipelines(dev, VK_NULL_HANDLE, 1, &cpci, NULL, &pipeline[p]));
@@ -486,7 +491,8 @@ static void dispatch(VkCommandBuffer cmd, int p, VkDescriptorSet set, const void
     vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, layout[p], 0, 1, &set, 0, NULL);
     if (push_size)
         vkCmdPushConstants(cmd, layout[p], VK_SHADER_STAGE_COMPUTE_BIT, 0, push_size, push);
-    vkCmdDispatch(cmd, (size.width + 7) / 8, (size.height + 7) / 8, 1);
+    VkExtent2D g = pipe_group(p, wide_x);
+    vkCmdDispatch(cmd, (size.width + g.width - 1) / g.width, (size.height + g.height - 1) / g.height, 1);
 }
 
 // Frame `pic` goes to history slot c; with ngen > 0, the frames between the other slot's and

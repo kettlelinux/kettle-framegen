@@ -24,17 +24,35 @@ static const struct pipe_spec {
     size_t size;
     uint32_t n;
     VkDescriptorType types[6];
+    bool wide;  // workgroup size from specialization constants 0 and 1 (see pipe_group())
 } pipe_specs[NPIPE] = {
-    [P_LUMA] = { spv_luma0, sizeof(spv_luma0), 2, { S, W } },
-    [P_DOWN] = { spv_down, sizeof(spv_down), 2, { S, W } },
-    [P_MOTION] = { spv_motion, sizeof(spv_motion), 5, { S, S, S, S, W } },
-    [P_FILTER] = { spv_filter, sizeof(spv_filter), 3, { S, W, B } },
-    [P_STILL] = { spv_still, sizeof(spv_still), 3, { S, S, W } },
-    [P_SYNTH] = { spv_synth, sizeof(spv_synth), 6, { S, S, S, W, B, S } },
+    [P_LUMA] = { spv_luma0, sizeof(spv_luma0), 2, { S, W }, true },
+    [P_DOWN] = { spv_down, sizeof(spv_down), 2, { S, W }, true },
+    [P_MOTION] = { spv_motion, sizeof(spv_motion), 5, { S, S, S, S, W }, false },
+    [P_FILTER] = { spv_filter, sizeof(spv_filter), 3, { S, W, B }, false },
+    [P_STILL] = { spv_still, sizeof(spv_still), 3, { S, S, W }, true },
+    [P_SYNTH] = { spv_synth, sizeof(spv_synth), 6, { S, S, S, W, B, S }, false },
 };
 #undef S
 #undef W
 #undef B
+
+// Workgroup size of pipeline p. The light per-pixel passes run in groups as large as the
+// device allows up to 256 (Vulkan only promises 128): on the Adreno 740 every group costs about
+// 30 ns whatever it does, and in 8x8 groups the still mask at 1080p took 1.04 ms, in 32x8 0.39.
+// The rest stay 8x8: their work is per block (motion, filter), or heavy enough that larger groups
+// ran slower (synth). wide_x: wide_group_x() of the device.
+static inline uint32_t wide_group_x(const VkPhysicalDeviceLimits *l)
+{
+    return l->maxComputeWorkGroupInvocations >= 256 && l->maxComputeWorkGroupSize[0] >= 32 ? 32 : 16;
+}
+
+static inline VkExtent2D pipe_group(int p, uint32_t wide_x)
+{
+    return pipe_specs[p].wide ? (VkExtent2D){ wide_x, 8 } : (VkExtent2D){ 8, 8 };
+}
+
+static const VkSpecializationMapEntry group_spec_map[2] = { { 0, 0, 4 }, { 1, 4, 4 } };
 
 // The one sampler every sampled binding uses
 static const VkSamplerCreateInfo sampler_info = {

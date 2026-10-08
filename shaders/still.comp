@@ -6,7 +6,8 @@
 // there is wrong (in flat colour, it would also match anything: bars bled into a loading
 // video, HUD colour into the scene).
 #version 450
-layout(local_size_x = 8, local_size_y = 8) in;
+layout(local_size_x = 16, local_size_y = 8) in;
+layout(local_size_x_id = 0, local_size_y_id = 1) in;  // shaders.h: pipe_group()
 
 layout(binding = 0) uniform sampler2D prev_img;
 layout(binding = 1) uniform sampler2D cur_img;
