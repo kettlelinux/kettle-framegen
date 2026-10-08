@@ -111,6 +111,38 @@ make test-update CASES=test/cases/<name>
 
 The motion between them is twice the game's, so they are harder than the game itself.
 
+### Recording what the display shows
+
+Some artifacts only show in motion: flicker where generated and real frames differ, judder, a
+frame repeated where the motion was lost. Single dumps can't show them, and a screen recorder
+blurs them with its own compression and drops frames. Set `record = <seconds>` with `dump` and
+the layer records every frame it presents, real and generated, in the order they are shown.
+The copies happen on the GPU with each present's own work, into memory reserved when the
+recording starts, and a thread of the layer's own writes them out, so the game isn't held up
+while it records. The frames are exactly what the display got:
+
+```
+dump = /home/me/rec
+record = 2
+record_crop = 960x540+1240+450
+```
+
+The frames go to `kettle-fg-rec-00000.ppm`, ... and `kettle-fg-rec.txt` lists each one with
+the game frame it belongs to, whether it is `real` or `gen k/n` (generated frame k of the n
+before that real frame), and when the layer queued it, in ms. That is not when it was shown:
+FIFO shows them a refresh apart. A real frame with no `gen` before it is a missed generated
+frame, which judders. Full frames are large (20 MB at 3440x1440), and the memory is reserved up
+front for the frames the display can show in that time, at most half the heap, so crop to what
+you are looking at. As a lossless video, for stepping through frame by frame (`.` and `,` in
+mpv):
+
+```sh
+ffmpeg -framerate 180 -i /home/me/rec/kettle-fg-rec-%05d.ppm -c:v ffv1 rec.mkv
+```
+
+Recording stops early if the room runs out, if frame generation turns off (multiplier 1), or
+when the swapchain goes. Then the rest is written out before the game goes on.
+
 ## Using it
 
 The layer stays off unless the game's environment has `KETTLE_FG=1`. On Steam, set it per game
@@ -147,6 +179,8 @@ example `KETTLE_FG_MULTIPLIER=3`) overrides the file.
 | `latency` | `normal` | `low` holds the game until its previous frame is on screen (below). |
 | `dump` | unset | Directory to save the next generated frames to, for debugging. |
 | `burst` | `0` | With `dump`: save this many real frames in a row instead (up to 16). |
+| `record` | `0` | With `dump`: record every frame shown for this many seconds instead (below). |
+| `record_crop` | whole frame | With `record`: only this part of each frame, `WxH+X+Y`. |
 
 With FIFO, frames are shown evenly only when the game renders fast enough to fill every refresh
 with the multiplier: a 45 fps game at 2x on a 120 Hz display shows each generated frame for one

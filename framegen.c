@@ -38,6 +38,7 @@
 #define MAX_GEN 2
 #define MAX_BURST 16          // generated frames per rendered one (3x); beyond it, too few real frames
 #define RING 3             // presents in flight
+#define REC_CHUNK (64u << 20)  // bytes per buffer of a recording (see rec_start())
 #define MAX_QUEUES 64
 // GPU timestamps per present: start, then the end of each stage
 enum { TS_START, TS_PYRAMID, TS_MOTION, TS_SYNTH, TS_OUTPUT, NTS };
@@ -77,6 +78,8 @@ struct config {
     bool low_latency;      // "latency = low": hold the game until its previous frame is shown
     char dump[512];        // save the next generated frames here ("dump = <dir>", see dump())
     int burst;             // "burst = <n>": instead, the next n real frames in a row (see burst())
+    float record;          // "record = <s>": instead, every frame shown for this long (see rec_start())
+    VkRect2D record_crop;  // "record_crop = WxH+X+Y": ...only this part of them; width 0: all
     unsigned dump_serial;  // counts file loads that asked for a dump
 };
 
@@ -115,6 +118,14 @@ static void config_set(struct config *c, const char *k, const char *v)
         c->burst = atoi(v);
     else if (!strcmp(k, "dump"))
         snprintf(c->dump, sizeof(c->dump), "%s", v);
+    else if (!strcmp(k, "record"))
+        c->record = strtof(v, NULL);
+    else if (!strcmp(k, "record_crop")) {
+        unsigned w, h;
+        int x = 0, y = 0;
+        if (sscanf(v, "%ux%u+%d+%d", &w, &h, &x, &y) >= 2)
+            c->record_crop = (VkRect2D){ { x, y }, { w, h } };
+    }
 }
 
 static char *trim(char *s)
@@ -168,6 +179,8 @@ static void config_load(void)
         c.flow_scale = 1.0f;
     if (!(c.refresh > 0.0f))  // NaN too
         c.refresh = 0.0f;
+    if (!(c.record > 0.0f))
+        c.record = 0.0f;
     if (c.dump[0])
         cfg_dump_serial++;
     c.dump_serial = cfg_dump_serial;
@@ -289,7 +302,8 @@ struct inst {
     X(CmdPipelineBarrier) X(CmdCopyImage) X(CmdBindPipeline) X(CmdBindDescriptorSets)         \
     X(CmdPushConstants) X(CmdDispatch) X(CmdResetQueryPool) X(CmdWriteTimestamp)            \
     X(CreateBuffer) X(DestroyBuffer) X(GetBufferMemoryRequirements) X(BindBufferMemory)       \
-    X(MapMemory) X(CmdCopyImageToBuffer) X(FreeCommandBuffers) X(CmdFillBuffer) X(CmdCopyBuffer)
+    X(MapMemory) X(CmdCopyImageToBuffer) X(FreeCommandBuffers) X(CmdFillBuffer) X(CmdCopyBuffer) \
+    X(GetFenceStatus) X(InvalidateMappedMemoryRanges)
 
 struct dev {
     struct dev *next;
@@ -306,6 +320,7 @@ struct dev {
     VkQueueFamilyProperties *families;
     uint32_t nfamilies;
     float ts_period;
+    VkDeviceSize atom;  // nonCoherentAtomSize
     struct { VkQueue queue; uint32_t family; } queues[MAX_QUEUES];
     uint32_t nqueues;
     // shared by all swapchains, created with the first one that needs them
@@ -343,6 +358,36 @@ struct pacing {
     double cap_until, cap_wait;  // ...and how long the next failed raise caps it
 };
 
+// A recording (rec_start()): the frames shown, in the order they are shown, copied on the GPU into
+// buffers made for all of them beforehand and written out by a thread of its own
+struct rec_frame {
+    uint64_t present;  // the game's frame it belongs to
+    uint8_t gen, ngen;  // generated frame gen of ngen before it, or gen == ngen: the game's own
+    double t;          // when it was queued for the display, s since the recording started
+};
+
+struct rec {
+    char dir[512];
+    VkRect2D crop;
+    bool ten, bgr;          // pixel format (as hist_format, bgr)
+    bool coherent;          // else ready frames are invalidated before the writer reads them
+    uint32_t n, per_chunk;  // frames there is room for, frames per buffer
+    uint32_t nchunks;
+    VkDeviceSize one, chunk_size;  // bytes per frame, per buffer's memory
+    VkBuffer *buf;
+    VkDeviceMemory *mem;
+    uint8_t **px;
+    struct rec_frame *frames;
+    uint32_t used;          // frames copied (or being copied)
+    uint32_t first[RING];   // the first frame each ring slot's commands copy, UINT32_MAX: none
+    double t0, until;       // started at, copies frames until
+    bool stopped;           // no more frames: rec_stop()
+    uint32_t ready;         // atomic: frames whose copies finished; the writer writes up to here
+    bool end;               // atomic: ready won't grow beyond used
+    bool done;              // atomic: the writer wrote everything
+    pthread_t thread;
+};
+
 struct frame {  // one present in flight
     VkCommandBuffer cmd;
     VkFence fence;
@@ -377,6 +422,7 @@ struct swapchain {
         VkCommandBuffer cmd[MAX_BURST];
         VkFence fence[MAX_BURST];
     } burst;
+    struct rec *rec;       // rec_start(): every frame shown, being recorded
     double probe_at;
     // Created on the first present (they need the present queue's family): the frame ring,
     // kept for the swapchain's life since presents wait on its semaphores, and the flow
@@ -710,6 +756,7 @@ static void sc_idle(struct swapchain *sc)
 }
 
 static void burst_free(struct swapchain *sc);
+static void rec_free(struct swapchain *sc);
 
 static void ring_free(struct swapchain *sc)
 {
@@ -732,6 +779,8 @@ static void ring_free(struct swapchain *sc)
     memset(sc->present_sems, 0, sc->nimages * sizeof(*sc->present_sems));
     if (sc->burst.buf || sc->burst.cmd[0])
         burst_free(sc);
+    if (sc->rec)
+        rec_free(sc);
     if (sc->pool)
         d->DestroyCommandPool(dev, sc->pool, NULL);
     if (sc->queries)
@@ -953,6 +1002,8 @@ static void run(struct dev *d, VkCommandBuffer cmd, int pipe, VkDescriptorSet se
     d->CmdDispatch(cmd, (size.width + 7) / 8, (size.height + 7) / 8, 1);
 }
 
+static void rec_copy(struct swapchain *sc, VkCommandBuffer cmd, int slot, uint32_t ngen);
+
 // Record one present's work: history copy and pyramid always (the next frame needs them),
 // motion and ngen generated frames into the acquired images acq[] when there are any.
 static void record(struct swapchain *sc, VkCommandBuffer cmd, int slot, uint32_t idx,
@@ -1074,30 +1125,38 @@ static void record(struct swapchain *sc, VkCommandBuffer cmd, int slot, uint32_t
     }
     STAMP(TS_OUTPUT);
 #undef STAMP
+    if (sc->rec)
+        rec_copy(sc, cmd, slot, ngen);
     d->EndCommandBuffer(cmd);
+}
+
+// w x h raw swapchain pixels (RGBA8 or A2B10G10R10, maybe BGR) as an 8-bit PPM
+static bool ppm(const char *path, const uint32_t *p, uint32_t w, uint32_t h, bool ten, bool bgr)
+{
+    FILE *o = fopen(path, "wb");
+    uint8_t *row = malloc((size_t)w * 3);
+    bool ok = o && row && fprintf(o, "P6\n%u %u\n255\n", w, h) > 0;
+    for (uint32_t y = 0; ok && y < h; y++) {
+        for (uint32_t x = 0; x < w; x++) {
+            uint32_t v = p[(size_t)w * y + x];
+            uint8_t c[3] = { v, v >> 8, v >> 16 };
+            if (ten)
+                c[0] = (v & 1023) >> 2, c[1] = ((v >> 10) & 1023) >> 2, c[2] = ((v >> 20) & 1023) >> 2;
+            row[3 * x] = c[bgr ? 2 : 0];
+            row[3 * x + 1] = c[1];
+            row[3 * x + 2] = c[bgr ? 0 : 2];
+        }
+        ok = fwrite(row, 3, w, o) == w;
+    }
+    free(row);
+    if (o && fclose(o))
+        ok = false;
+    return ok;
 }
 
 static void write_ppm(struct swapchain *sc, const char *path, const uint32_t *p)
 {
-    uint32_t w = sc->extent.width, h = sc->extent.height;
-    bool ten = sc->hist_format == VK_FORMAT_A2B10G10R10_UNORM_PACK32;
-    FILE *o = fopen(path, "wb");
-    if (!o)
-        return;
-    fprintf(o, "P6\n%u %u\n255\n", w, h);
-    for (size_t j = 0; j < (size_t)w * h; j++) {
-        uint32_t v = p[j];
-        uint8_t c[3] = { v, v >> 8, v >> 16 };
-        if (ten)
-            c[0] = (v & 1023) >> 2, c[1] = ((v >> 10) & 1023) >> 2, c[2] = ((v >> 20) & 1023) >> 2;
-        if (sc->bgr) {
-            uint8_t t = c[0];
-            c[0] = c[2];
-            c[2] = t;
-        }
-        fwrite(c, 1, 3, o);
-    }
-    fclose(o);
+    ppm(path, p, sc->extent.width, sc->extent.height, sc->hist_format == VK_FORMAT_A2B10G10R10_UNORM_PACK32, sc->bgr);
 }
 
 static void burst_free(struct swapchain *sc)
@@ -1303,6 +1362,284 @@ out:
         d->DestroyBuffer(dev, buf, NULL);
     if (mem)
         d->FreeMemory(dev, mem, NULL);  // unmaps
+}
+
+// ---------- recording ----------
+
+// Debugging: every frame shown for `record = <s>` seconds (with `dump = <dir>`, at the next
+// present after the settings file asks), real and generated alike, in the order they are shown:
+// <dir>/kettle-fg-rec-<n>.ppm from 00000, and <dir>/kettle-fg-rec.txt telling which is which and
+// when each was queued for the display. Unlike dump, nothing waits: each present's commands copy
+// its frames into host memory made for the whole recording when it starts, and a thread writes
+// them out as their copies finish. So the frames are the ones the game would have shown anyway,
+// at its own pace, flicker and judder included. `record_crop = WxH+X+Y` keeps a part of them,
+// which saves memory (full frames are large: 20 MB each at 3440x1440) and disk time.
+// `ffmpeg -framerate <hz> -i kettle-fg-rec-%05d.ppm -c:v ffv1 rec.mkv` makes a lossless video.
+static void *rec_writer(void *arg)
+{
+    struct rec *r = arg;
+    uint32_t w = r->crop.extent.width, h = r->crop.extent.height, i = 0;
+    bool ok = true;
+    for (;;) {
+        bool end = __atomic_load_n(&r->end, __ATOMIC_ACQUIRE);
+        uint32_t ready = __atomic_load_n(&r->ready, __ATOMIC_ACQUIRE);
+        if (ok && i < ready) {
+            char path[600];
+            snprintf(path, sizeof(path), "%s/kettle-fg-rec-%05u.ppm", r->dir, i);
+            const uint8_t *p = r->px[i / r->per_chunk] + (i % r->per_chunk) * r->one;
+            if (!(ok = ppm(path, (const uint32_t *)p, w, h, r->ten, r->bgr)))
+                say("recording: can't write %s, stopped writing", path);
+            i++;
+            continue;
+        }
+        if (end && (!ok || i >= ready))
+            break;
+        nanosleep(&(struct timespec){ 0, 2000000 }, NULL);
+    }
+    char path[600];
+    snprintf(path, sizeof(path), "%s/kettle-fg-rec.txt", r->dir);
+    FILE *o = ok ? fopen(path, "w") : NULL;
+    if (o) {
+        fprintf(o, "# kettle-framegen recording of %ux%u+%d+%d, frames in the order shown\n", w, h,
+                r->crop.offset.x, r->crop.offset.y);
+        fprintf(o, "# frame present queued_ms kind (gen k/n: generated frame k of the n before the game's frame)\n");
+        for (uint32_t k = 0; k < i; k++) {
+            const struct rec_frame *f = &r->frames[k];
+            fprintf(o, "%05u %llu %.3f ", k, (unsigned long long)f->present, f->t * 1e3);
+            if (f->gen < f->ngen)
+                fprintf(o, "gen %u/%u\n", f->gen + 1, f->ngen);
+            else
+                fprintf(o, "real\n");
+        }
+        if (fclose(o))
+            ok = false;
+    }
+    if (ok)
+        say("recording: wrote %u frames to %s", i, r->dir);
+    __atomic_store_n(&r->done, true, __ATOMIC_RELEASE);
+    return NULL;
+}
+
+static void rec_destroy(struct dev *d, struct rec *r)
+{
+    for (uint32_t k = 0; k < r->nchunks; k++) {
+        if (r->buf && r->buf[k])
+            d->DestroyBuffer(d->handle, r->buf[k], NULL);
+        if (r->mem && r->mem[k])
+            d->FreeMemory(d->handle, r->mem[k], NULL);  // unmaps
+    }
+    free(r->buf);
+    free(r->mem);
+    free(r->px);
+    free(r->frames);
+    free(r);
+}
+
+static float display_refresh(struct swapchain *sc, double t);
+
+static void rec_start(struct swapchain *sc, const struct config *c)
+{
+    struct dev *d = sc->dev;
+    VkDevice dev = d->handle;
+    VkExtent2D e = sc->extent;
+    VkRect2D crop = { { 0, 0 }, e };
+    if (c->record_crop.extent.width) {
+        crop = c->record_crop;
+        crop.offset.x = crop.offset.x < 0 ? 0 : crop.offset.x >= (int32_t)e.width ? (int32_t)e.width - 1 : crop.offset.x;
+        crop.offset.y = crop.offset.y < 0 ? 0 : crop.offset.y >= (int32_t)e.height ? (int32_t)e.height - 1 : crop.offset.y;
+        if (crop.extent.width > e.width - crop.offset.x)
+            crop.extent.width = e.width - crop.offset.x;
+        if (crop.extent.height > e.height - crop.offset.y)
+            crop.extent.height = e.height - crop.offset.y;
+        if (!crop.extent.height)
+            crop.extent.height = 1;
+    }
+    // Room for the frames FIFO can show in that time, at most half the memory heap
+    float hz = c->refresh > 0             ? c->refresh
+               : display_refresh(sc, now_s()) > 0 ? sc->timing_hz
+               : sc->pace.hz_t >= 3.0     ? (float)(sc->pace.hz_shown / sc->pace.hz_t)
+                                          : 240.0f;
+    VkDeviceSize one = (VkDeviceSize)crop.extent.width * crop.extent.height * 4;
+    double want = ceil(c->record * hz * 1.05) + MAX_GEN + 1;
+    uint32_t per_chunk = one >= REC_CHUNK ? 1 : (uint32_t)(REC_CHUNK / one);
+    struct rec *r = calloc(1, sizeof(*r));
+    if (!r)
+        return;
+    snprintf(r->dir, sizeof(r->dir), "%s", c->dump);
+    r->crop = crop;
+    r->ten = sc->hist_format == VK_FORMAT_A2B10G10R10_UNORM_PACK32;
+    r->bgr = sc->bgr;
+    r->one = one;
+    r->per_chunk = per_chunk;
+    r->nchunks = (uint32_t)ceil(want / per_chunk);
+    for (int s = 0; s < RING; s++)
+        r->first[s] = UINT32_MAX;
+    if (!(r->buf = calloc(r->nchunks, sizeof(*r->buf))) || !(r->mem = calloc(r->nchunks, sizeof(*r->mem))) ||
+        !(r->px = calloc(r->nchunks, sizeof(*r->px)))) {
+        rec_destroy(d, r);
+        return;
+    }
+    // The writer reads every byte: cached memory (on ARM the cached kind often isn't coherent,
+    // and its ready frames are invalidated), else coherent uncached
+    VkBufferCreateInfo bci = {
+        .sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO,
+        .size = one * per_chunk,
+        .usage = VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+    };
+    uint32_t type = UINT32_MAX, made = 0;
+    VkDeviceSize limit = 0;
+    for (; made < r->nchunks; made++) {
+        if (d->CreateBuffer(dev, &bci, NULL, &r->buf[made]) != VK_SUCCESS)
+            break;
+        VkMemoryRequirements req;
+        d->GetBufferMemoryRequirements(dev, r->buf[made], &req);
+        if (type == UINT32_MAX) {
+            static const VkMemoryPropertyFlags pick[] = {
+                VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_CACHED_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
+                VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_CACHED_BIT,
+                VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
+            };
+            for (size_t p = 0; p < sizeof(pick) / sizeof(*pick) && type == UINT32_MAX; p++)
+                for (uint32_t i = 0; i < d->mem.memoryTypeCount && type == UINT32_MAX; i++)
+                    if ((req.memoryTypeBits & (1u << i)) && (d->mem.memoryTypes[i].propertyFlags & pick[p]) == pick[p])
+                        type = i;
+            if (type == UINT32_MAX)
+                break;
+            r->coherent = d->mem.memoryTypes[type].propertyFlags & VK_MEMORY_PROPERTY_HOST_COHERENT_BIT;
+            r->chunk_size = req.size;
+            limit = d->mem.memoryHeaps[d->mem.memoryTypes[type].heapIndex].size / 2;
+        }
+        if ((made + 1) * req.size > limit)
+            break;
+        VkMemoryAllocateInfo ai = { .sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO, .allocationSize = req.size,
+                                    .memoryTypeIndex = type };
+        void *px;
+        if (d->AllocateMemory(dev, &ai, NULL, &r->mem[made]) != VK_SUCCESS)
+            break;
+        if (d->BindBufferMemory(dev, r->buf[made], r->mem[made], 0) != VK_SUCCESS ||
+            d->MapMemory(dev, r->mem[made], 0, VK_WHOLE_SIZE, 0, &px) != VK_SUCCESS) {
+            made++;  // freed below
+            break;
+        }
+        r->px[made] = px;
+    }
+    // what was made in full, if not all: fewer frames
+    while (made && !r->px[made - 1])
+        made--;
+    for (uint32_t k = made; k < r->nchunks; k++) {
+        if (r->buf[k])
+            d->DestroyBuffer(dev, r->buf[k], NULL);
+        if (r->mem[k])
+            d->FreeMemory(dev, r->mem[k], NULL);
+        r->buf[k] = VK_NULL_HANDLE;
+        r->mem[k] = VK_NULL_HANDLE;
+    }
+    r->nchunks = made;
+    r->n = made * per_chunk;
+    if (r->n > want)
+        r->n = (uint32_t)want;
+    if (r->n < MAX_GEN + 1 || !(r->frames = calloc(r->n, sizeof(*r->frames))) ||
+        pthread_create(&r->thread, NULL, rec_writer, r)) {
+        say("recording to %s: out of memory", r->dir);
+        rec_destroy(d, r);
+        return;
+    }
+    r->t0 = now_s();
+    r->until = r->t0 + c->record;
+    sc->rec = r;
+    say("recording %.1f s of %ux%u+%d+%d to %s (room for %u frames, %.0f MB%s)", c->record, crop.extent.width,
+        crop.extent.height, crop.offset.x, crop.offset.y, r->dir, r->n, (double)made * r->chunk_size / 1048576.0,
+        r->n < want ? ", less than wanted" : "");
+}
+
+static void rec_stop(struct swapchain *sc, const char *why)
+{
+    struct rec *r = sc->rec;
+    if (r->stopped)
+        return;
+    r->stopped = true;
+    say("recording: %u frames in %.2f s%s%s, writing them out", r->used, now_s() - r->t0, why ? ", stopped: " : "",
+        why ? why : "");
+}
+
+// This present's frames, shown in this order: the generated ones, then the game's own (hist[cur])
+static void rec_copy(struct swapchain *sc, VkCommandBuffer cmd, int slot, uint32_t ngen)
+{
+    struct rec *r = sc->rec;
+    struct dev *d = sc->dev;
+    r->first[slot] = UINT32_MAX;
+    if (!r->stopped && now_s() >= r->until)
+        rec_stop(sc, NULL);
+    else if (!r->stopped && r->used + ngen + 1 > r->n)
+        rec_stop(sc, "out of room");
+    if (r->stopped)
+        return;
+    r->first[slot] = r->used;
+    barrier(d, cmd, VK_PIPELINE_STAGE_TRANSFER_BIT | VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+            VK_ACCESS_TRANSFER_WRITE_BIT | VK_ACCESS_SHADER_WRITE_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT,
+            VK_ACCESS_TRANSFER_READ_BIT);
+    for (uint32_t k = 0; k <= ngen; k++) {
+        uint32_t i = r->used++;
+        VkBufferImageCopy reg = {
+            .bufferOffset = (i % r->per_chunk) * r->one,
+            .imageSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 },
+            .imageOffset = { r->crop.offset.x, r->crop.offset.y, 0 },
+            .imageExtent = { r->crop.extent.width, r->crop.extent.height, 1 },
+        };
+        d->CmdCopyImageToBuffer(cmd, k < ngen ? sc->out[k].image : sc->hist[sc->cur].image, VK_IMAGE_LAYOUT_GENERAL,
+                                r->buf[i / r->per_chunk], 1, &reg);
+        r->frames[i] = (struct rec_frame){ .present = sc->count, .gen = k, .ngen = ngen };
+    }
+    barrier(d, cmd, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_TRANSFER_WRITE_BIT, VK_PIPELINE_STAGE_HOST_BIT,
+            VK_ACCESS_HOST_READ_BIT);
+}
+
+// Hands the frames whose copies finished to the writer (all of them when idle: nothing in flight)
+// and, once it wrote everything, frees the recording.
+static void rec_poll(struct swapchain *sc, bool idle)
+{
+    struct rec *r = sc->rec;
+    struct dev *d = sc->dev;
+    uint32_t ready = r->used, old = r->ready;
+    for (int s = 0; !idle && s < RING; s++) {
+        struct frame *f = &sc->frames[s];
+        if (r->first[s] < ready && f->pending && d->GetFenceStatus(d->handle, f->fence) != VK_SUCCESS)
+            ready = r->first[s];
+    }
+    if (ready > old) {
+        for (uint32_t k = old / r->per_chunk; !r->coherent && k <= (ready - 1) / r->per_chunk; k++) {
+            uint32_t lo = old > k * r->per_chunk ? old - k * r->per_chunk : 0;
+            uint32_t hi = ready < (k + 1) * r->per_chunk ? ready - k * r->per_chunk : r->per_chunk;
+            VkDeviceSize at = lo * r->one / d->atom * d->atom, end = (hi * r->one + d->atom - 1) / d->atom * d->atom;
+            VkMappedMemoryRange mr = { .sType = VK_STRUCTURE_TYPE_MAPPED_MEMORY_RANGE, .memory = r->mem[k], .offset = at,
+                                       .size = end >= r->chunk_size ? VK_WHOLE_SIZE : end - at };
+            d->InvalidateMappedMemoryRanges(d->handle, 1, &mr);
+        }
+        __atomic_store_n(&r->ready, ready, __ATOMIC_RELEASE);
+    }
+    if (r->stopped && ready == r->used)
+        __atomic_store_n(&r->end, true, __ATOMIC_RELEASE);
+    if (__atomic_load_n(&r->done, __ATOMIC_ACQUIRE)) {
+        pthread_join(r->thread, NULL);
+        rec_destroy(d, r);
+        sc->rec = NULL;
+    }
+}
+
+// The swapchain goes (or its queue family changes): what was recorded is written out first
+static void rec_free(struct swapchain *sc)
+{
+    struct rec *r = sc->rec;
+    sc_idle(sc);
+    rec_stop(sc, "the swapchain went");
+    rec_poll(sc, true);
+    if (sc->rec) {
+        if (r->ready > 0)
+            say("recording: waiting for the rest to be written");
+        pthread_join(r->thread, NULL);
+        rec_destroy(sc->dev, r);
+        sc->rec = NULL;
+    }
 }
 
 static void stats(struct swapchain *sc, int slot, int multiplier, bool low)
@@ -1552,8 +1889,12 @@ static VkResult present_frames(VkQueue queue, const VkPresentInfoKHR *pi, struct
     double now = now_s();
     int mult = c.multiplier ? c.multiplier : pace(sc, now, c.refresh > 0 ? c.refresh : display_refresh(sc, now));
     status_write(mult);
+    if (sc->rec)
+        rec_poll(sc, false);
     uint32_t family = queue_family(d, queue);
     if (mult < 2 || family >= d->nfamilies || !(d->families[family].queueFlags & VK_QUEUE_COMPUTE_BIT)) {
+        if (sc->rec)
+            rec_stop(sc, "frame generation went off");
         sc->have_prev = sc->have_mv = false;
         return present_game(sc, queue, pi, c.low_latency);
     }
@@ -1619,8 +1960,17 @@ static VkResult present_frames(VkQueue queue, const VkPresentInfoKHR *pi, struct
         ngen++;
     }
 
+    if (c.record > 0 && c.burst <= 0 && c.dump[0] && c.dump_serial != sc->dump_serial) {
+        sc->dump_serial = c.dump_serial;
+        if (sc->rec)
+            say("recording to %s: the last recording is still being written", c.dump);
+        else
+            rec_start(sc, &c);
+    }
+    uint32_t rec_at = sc->rec ? sc->rec->used : 0;  // its first frame this present, if it records any
     bool fresh = sc->fresh;
     record(sc, f->cmd, slot, idx, acq, ngen, mult, c.flow);
+    bool rec = sc->rec && sc->rec->used > rec_at;
 
     // The game's wait semaphores gate our copy of its frame; its present then waits for us.
     uint32_t nwait = pi->waitSemaphoreCount + ngen;
@@ -1652,6 +2002,10 @@ static VkResult present_frames(VkQueue queue, const VkPresentInfoKHR *pi, struct
         // (their presents consume the acquire semaphores; they show stale contents) and present
         // the game's frame as it asked, or the swapchain runs out of images.
         sc->fresh = fresh;  // its layout transitions didn't run
+        if (rec) {
+            sc->rec->used = rec_at;
+            sc->rec->first[slot] = UINT32_MAX;
+        }
         sc->have_prev = sc->have_mv = false;
         for (uint32_t k = 0; k < ngen; k++)
             present_image(sc, queue, acq[k], f->acquired[k]);
@@ -1675,12 +2029,17 @@ static VkResult present_frames(VkQueue queue, const VkPresentInfoKHR *pi, struct
     if (sc->burst.n)
         burst_capture(sc, queue);
 
-    for (uint32_t k = 0; k < ngen; k++)
+    for (uint32_t k = 0; k < ngen; k++) {
         present_image(sc, queue, acq[k], sc->present_sems[acq[k]]);
+        if (rec)
+            sc->rec->frames[rec_at + k].t = now_s() - sc->rec->t0;
+    }
     VkPresentInfoKHR real = *pi;
     real.waitSemaphoreCount = 1;
     real.pWaitSemaphores = &sc->present_sems[idx];
     r = present_game(sc, queue, &real, c.low_latency);
+    if (rec)
+        sc->rec->frames[rec_at + ngen].t = now_s() - sc->rec->t0;
 
     sc->shown += ngen + 1;
     sc->count++;
@@ -2137,6 +2496,7 @@ static VKAPI_ATTR VkResult VKAPI_CALL CreateDevice(VkPhysicalDevice phys, const 
     VkPhysicalDeviceProperties props;
     i->GetPhysicalDeviceProperties(phys, &props);
     d->ts_period = props.limits.timestampPeriod;
+    d->atom = props.limits.nonCoherentAtomSize ? props.limits.nonCoherentAtomSize : 1;
     d->key = KEY(*out);
     d->handle = *out;
     d->phys = phys;
