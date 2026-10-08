@@ -2279,13 +2279,16 @@ static VKAPI_ATTR VkResult VKAPI_CALL CreateSwapchainKHR(VkDevice device, const 
         sc->bgr = bgr;
         sc->fifo = c.fifo;
         sc->timing = timing;
-        // a recreated swapchain (resize, mode change) keeps what auto pacing has learned
+        // a recreated swapchain (resize, mode change) keeps what auto pacing has learned, and
+        // whether the game was below min_fps
         struct swapchain *old = ci->oldSwapchain ? find_sc(ci->oldSwapchain, false) : NULL;
         if (old && old->pace.n) {
             sc->pace = old->pace;
             sc->pace.waited_ns = 0;
             sc->pace.settle = true;
         }
+        if (old)
+            sc->floor = (struct rate_floor){ .off = old->floor.off };
         pthread_mutex_lock(&lock);
         sc->next = swapchains;
         swapchains = sc;
