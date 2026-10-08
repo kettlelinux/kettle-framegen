@@ -76,7 +76,7 @@ device: llvmpipe (LLVM 21.1.8, 256 bits)
 ...
 object          1-1   cut  0.7%  truth  32.19 dB  ref  63.97 dB   0.00% off  ok
 ...
-20 of 20 cases passed
+21 of 21 cases passed
 ```
 
 Per generated frame: the share of blocks no vector matched (above 30% counts as a scene cut),

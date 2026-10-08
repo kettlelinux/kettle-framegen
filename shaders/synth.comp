@@ -22,8 +22,14 @@
 // it is background that a figure in front covers in one frame (the halo around a character
 // as the camera turns): the background is the candidate closest to the frame's mean motion
 // (games move the camera; the figures are what moves differently), and along it, one frame's
-// sample shows the figure. That one is told apart by following it with the figure's vector into
-// the other frame and finding it again there; the pixel comes from the other frame alone.
+// sample shows the figure. Which one is told first by where the figure is: background moving
+// into it is shown before and hidden after (the previous frame), coming out from behind it the
+// other way round, and the vector field a little way off on either side shows the figure's side.
+// That decides a strip beside a sword as a whole, where a test per pixel flips between the
+// frames (specks along the blade as the camera turns). Where the field doesn't show the figure
+// on one side (it is smaller than a block, a mouse cursor), the frame is told by following its
+// sample with the figure's vector into the other frame and finding it again there; the pixel
+// comes from the other frame alone.
 // Where that doesn't settle it, it comes from the frame nearer in time. And where the
 // background's vector fails and no figure's fits, but that test finds the figure, the pixel is
 // such background even if some other vector agrees, by chance (specks beside a thin figure).
@@ -165,6 +171,27 @@ bool uncovered(vec2 q, vec2 vb, vec2 vf, out mediump vec4 shown)
     return a_hidden != b_hidden;
 }
 
+// Where the pixel at q is background beside a figure: the background moves by vb - vf against
+// it, so where the figure lies ahead of q along that, the background runs into it and the
+// previous frame shows it, else it comes out from behind it and the current frame does. The
+// figure's side is the one whose block vectors are near vf. True when that settles it, with
+// that frame's sample along vb in `shown`.
+bool covers(vec2 q, vec2 vb, vec2 vf, out mediump vec4 shown)
+{
+    vec2 r = vb - vf;
+    vec2 d = normalize(r) * max(8.0, 0.5 * length(r));
+    vec2 c = q - (pc.t - 0.5) * vf;  // the field has the figure where it is at t = 0.5
+    float ahead = distance(textureLod(mv, (c + d) * pc.mv_uv, 0.0).xy * pc.mv_to_px, vf);
+    float behind = distance(textureLod(mv, (c - d) * pc.mv_uv, 0.0).xy * pc.mv_to_px, vf);
+    bool before = ahead < behind;
+    vec2 qs = before ? q - pc.t * vb : q + (1.0 - pc.t) * vb;
+    if (!inside(qs) || abs(ahead - behind) < 1.0 || min(ahead, behind) > max(1.0, 0.25 * length(r)))
+        return false;
+    vec2 rcp = 1.0 / pc.size;
+    shown = before ? textureLod(prev_img, qs * rcp, 0.0) : textureLod(cur_img, qs * rcp, 0.0);
+    return true;
+}
+
 void main()
 {
     ivec2 p = ivec2(gl_GlobalInvocationID.xy);
@@ -249,9 +276,14 @@ void main()
         // thin figures): the frame showing the background is used
         mediump float occ = smoothstep(0.5, 0.7, cost[kb]) * smoothstep(0.2, 0.4, figure);
         mediump vec4 shown;
-        if ((w > 0.0 || occ > 0.0) && distance(vf, vb) > 1.0 && uncovered(q, vb, vf, shown)) {
-            alone = shown;
-            w = max(w, occ);
+        if ((w > 0.0 || occ > 0.0) && distance(vf, vb) > 1.0) {
+            // the colour test says whether it is hidden; the figure's side, where it can,
+            // which frame shows it
+            bool told = uncovered(q, vb, vf, shown);
+            if (told)
+                w = max(w, occ);
+            mediump vec4 side;
+            alone = covers(q, vb, vf, side) ? side : told ? shown : alone;
         }
     }
     mediump vec4 c = mix(mix(a, b, pc.t), alone, w);
