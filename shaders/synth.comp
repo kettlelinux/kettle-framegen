@@ -100,6 +100,11 @@ vec2 mean;                   // the frame's mean motion: the camera's
 mediump float figure = 1e4;  // the best match of a vector away from it: a figure's
 float scale;                 // how much of the frame is lost (see main): 1 none .. 0 all
 mediump float lost = 0.0;    // how lost the motion is here
+// every candidate's blend weighed by 1 / (cost^2 + SOFT_E), summed as they come
+mediump vec4 soft_sum = vec4(0.0);
+mediump float soft_w = 0.0;
+const mediump float SOFT_E = 0.01;
+const mediump float SOFT_FROM = 0.2, SOFT_TO = 0.5;  // the best match from which the blend is used
 
 const mediump float FIGURE_MATCH = 0.2;  // a figure's vector matching better than this...
 const mediump float FIGURE_GAIN = 0.1;   // ...is preferred by up to this much
@@ -149,6 +154,9 @@ mediump float try_vector(vec2 q, vec2 v, mediump float bias)
              smoothstep(1.0, 4.0, distance(v, mean));
     }
     c += bias;
+    mediump float wk = 1.0 / (max(c, 0.0) * max(c, 0.0) + SOFT_E);
+    soft_sum += wk * mix(pa, pb, pc.t);
+    soft_w += wk;
     if (distance(v, mean) > 2.0)
         figure = min(figure, c);
     if (c < best) {
@@ -331,7 +339,16 @@ void main()
             alone = on_side ? side : told ? shown : alone;
         }
     }
-    mediump vec4 c = mix(mix(a, b, pc.t), alone, w);
+    mediump vec4 base = mix(a, b, pc.t);
+    if (flow && soft_w > 0.0) {
+        // Where no vector fits (beside a figure, the strip whose background one frame doesn't
+        // show; fine texture in a fast turn), each pixel's own pick flips between candidates
+        // from pixel to pixel (sparkle around a sword at 30 fps): the candidates' blends weighed
+        // by how well each fits instead, which changes smoothly from pixel to pixel
+        mediump float soften = smoothstep(SOFT_FROM, SOFT_TO, best);
+        base = mix(base, soft_sum / soft_w, soften);
+    }
+    mediump vec4 c = mix(base, alone, w);
     if (flow && lost > 0.0) {
         // Lost motion falls back on the nearer frame alone. Where the blocks still matched
         // fairly, their vectors are right and only the content changed between the frames (a
