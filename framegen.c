@@ -501,7 +501,7 @@ static bool pipelines_create(struct dev *d)
         if (d->pipe[p])
             continue;
         const struct pipe_spec *s = &pipe_specs[p];
-        VkDescriptorSetLayoutBinding b[5];
+        VkDescriptorSetLayoutBinding b[sizeof(s->types) / sizeof(*s->types)];
         for (uint32_t i = 0; i < s->n; i++)
             b[i] = (VkDescriptorSetLayoutBinding){ i, s->types[i], 1, VK_SHADER_STAGE_COMPUTE_BIT, NULL };
         VkDescriptorSetLayoutCreateInfo dci = {
