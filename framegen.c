@@ -70,6 +70,7 @@ static double now_s(void)
 struct config {
     int multiplier;        // frames shown per rendered one; 1 = off, 0 = auto (see pace())
     float refresh;         // display refresh rate in Hz for auto; 0 = measure it
+    float min_fps;         // below this rendered rate, no generated frames; 0 = no floor (see below_min_fps())
     float flow_scale;      // motion estimation resolution, fraction of the frame
     bool flow;             // false: plain blend without motion ("mode = blend")
     bool fifo;             // force FIFO presentation (read at swapchain creation)
@@ -102,6 +103,8 @@ static void config_set(struct config *c, const char *k, const char *v)
         c->multiplier = !strcasecmp(v, "auto") ? 0 : atoi(v) < 1 ? 1 : atoi(v);
     else if (!strcmp(k, "refresh"))
         c->refresh = strtof(v, NULL);
+    else if (!strcmp(k, "min_fps"))
+        c->min_fps = strtof(v, NULL);
     else if (!strcmp(k, "flow_scale"))
         c->flow_scale = strtof(v, NULL);
     else if (!strcmp(k, "mode"))
@@ -161,7 +164,7 @@ static void config_load(void)
         }
         fclose(f);
     }
-    static const char *const keys[] = { "multiplier", "refresh", "flow_scale", "mode", "fifo", "preserve_images", "stats", "latency" };
+    static const char *const keys[] = { "multiplier", "refresh", "min_fps", "flow_scale", "mode", "fifo", "preserve_images", "stats", "latency" };
     for (size_t i = 0; i < sizeof(keys) / sizeof(*keys); i++) {
         char env[64];
         snprintf(env, sizeof(env), "KETTLE_FG_%s", keys[i]);
@@ -181,6 +184,8 @@ static void config_load(void)
         c.refresh = 0.0f;
     if (!(c.record > 0.0f))
         c.record = 0.0f;
+    if (!(c.min_fps > 0.0f))
+        c.min_fps = 0.0f;
     if (c.dump[0])
         cfg_dump_serial++;
     c.dump_serial = cfg_dump_serial;
@@ -257,8 +262,11 @@ static struct config config_get(void)
         char mult[8] = "auto";
         if (cfg.multiplier)
             snprintf(mult, sizeof(mult), "%dx", cfg.multiplier);
-        say("%s: %s, %s, flow scale %.2f%s%s", cfg_path, mult, cfg.flow ? "motion" : "blend", cfg.flow_scale,
-            cfg.fifo ? ", fifo" : "", cfg.preserve_images ? ", preserve images" : "");
+        char min[32] = "";
+        if (cfg.min_fps > 0)
+            snprintf(min, sizeof(min), ", min %.0f fps", cfg.min_fps);
+        say("%s: %s%s, %s, flow scale %.2f%s%s", cfg_path, mult, min, cfg.flow ? "motion" : "blend",
+            cfg.flow_scale, cfg.fifo ? ", fifo" : "", cfg.preserve_images ? ", preserve images" : "");
     }
     if (changed || t - cfg_checked >= 0.5)
         cfg_checked = t;
@@ -389,6 +397,15 @@ struct rec {
     pthread_t thread;
 };
 
+// min_fps, per swapchain (see below_min_fps())
+struct rate_floor {
+    double win_t;               // window start, 0 before the first present with a floor set
+    uint32_t win_n, win_shown;  // presents and frames shown in it
+    uint64_t waited_ns;         // display waits in it (atomic, as pacing's)
+    int below;                  // windows in a row below the floor
+    bool off;                   // generation off for it
+};
+
 struct frame {  // one present in flight
     VkCommandBuffer cmd;
     VkFence fence;
@@ -452,6 +469,7 @@ struct swapchain {
     VkBuffer cut;                // blocks no vector matched (filter.comp -> synth.comp)
     VkDeviceMemory cut_mem;
     struct pacing pace;
+    struct rate_floor floor;
     // Latency (present_wait): the id of the game's last presented frame and of the one before,
     // and per stats period: presents, how many found the one before not yet shown, time waited
     uint64_t present_id, prev_id;
@@ -1723,7 +1741,8 @@ static float display_refresh(struct swapchain *sc, double t)
 // A raise that falls well short of the frames it should show (the rendered rate before it times
 // the new multiplier, at most the refresh rate) costs rendered frames for little (the swapchain
 // can run short of images to queue its frames in), so it is undone and not repeated for a while.
-static int pace(struct swapchain *sc, double t, float refresh)
+// Never above `most` (min_fps: a multiplier that would hold the game below it).
+static int pace(struct swapchain *sc, double t, float refresh, int most)
 {
     struct pacing *p = &sc->pace;
     if (!p->n) {
@@ -1746,6 +1765,8 @@ static int pace(struct swapchain *sc, double t, float refresh)
     double hz = refresh > 0 ? refresh : p->hz_t >= 3.0 ? p->hz_shown / p->hz_t : 0.0;
     bool held = refresh > 0 ? shown >= 0.95 * refresh : waited > 0.02 * dt;
     int n = p->n, top = t < p->cap_until ? p->cap : MAX_GEN + 1;
+    if (top > most)
+        top = most;
     bool judged = !p->settle && dt < 1.5;
     double due = p->up_fps * n;
     if (hz > 0)
@@ -1793,6 +1814,8 @@ static int pace(struct swapchain *sc, double t, float refresh)
             n = want < top ? want : top;
         }
     }
+    if (n > most)
+        n = most;  // min_fps set or raised since
     if (judged && n == p->n && !(short_of && p->up_short < 2)) {
         if (p->up_fps > 0)
             p->cap_wait = PACE_TRY;  // the raise delivered
@@ -1816,7 +1839,9 @@ static int pace(struct swapchain *sc, double t, float refresh)
 // Counts time the game spent waiting for the display, for pace()
 static void waited(struct swapchain *sc, double since)
 {
-    __atomic_fetch_add(&sc->pace.waited_ns, (uint64_t)((now_s() - since) * 1e9), __ATOMIC_RELAXED);
+    uint64_t ns = (uint64_t)((now_s() - since) * 1e9);
+    __atomic_fetch_add(&sc->pace.waited_ns, ns, __ATOMIC_RELAXED);
+    __atomic_fetch_add(&sc->floor.waited_ns, ns, __ATOMIC_RELAXED);
 }
 
 static VkResult present(struct swapchain *sc, VkQueue queue, const VkPresentInfoKHR *pi)
@@ -1825,6 +1850,7 @@ static VkResult present(struct swapchain *sc, VkQueue queue, const VkPresentInfo
     VkResult r = sc->dev->QueuePresentKHR(queue, pi);
     waited(sc, t);
     sc->pace.win_shown++;
+    sc->floor.win_shown++;
     return r;
 }
 
@@ -1871,6 +1897,72 @@ static VkResult present_game(struct swapchain *sc, VkQueue queue, const VkPresen
     return r;
 }
 
+// min_fps: below it, a game's frames go out without generated ones between them. Each real
+// frame waits for the next one to be rendered before the frames between can be made, so at a
+// low rate that wait is long, and the motion between frames is too far to follow well. Judged
+// once a second on the rate the game renders at by itself: where FIFO holds it at refresh /
+// multiplier (the display full, as pace() tells it), it could go faster and the floor doesn't
+// apply (multiplier = auto never holds it below the floor). Off after two windows below, so a
+// single hitch doesn't flip it; back on once the rate is a tenth above the floor, so a game
+// sitting on it doesn't flip between the two.
+static bool below_min_fps(struct swapchain *sc, double t, float min_fps, float refresh)
+{
+    struct rate_floor *m = &sc->floor;
+    if (!(min_fps > 0)) {
+        if (m->off)
+            say("no minimum frame rate, frame generation back on");
+        *m = (struct rate_floor){ 0 };
+        return false;
+    }
+    if (!m->win_t) {
+        m->win_t = t;
+        __atomic_store_n(&m->waited_ns, 0, __ATOMIC_RELAXED);
+    }
+    double dt = t - m->win_t;
+    if (dt < 1.0) {
+        m->win_n++;
+        return m->off;
+    }
+    double waited = __atomic_exchange_n(&m->waited_ns, 0, __ATOMIC_RELAXED) * 1e-9;
+    double fps = m->win_n / dt, shown = m->win_shown / dt;
+    if (dt < 1.5) {  // longer: the game stalled (loading, hidden), the window says nothing
+        bool held = refresh > 0 ? shown >= 0.95 * refresh : waited > 0.02 * dt;
+        if (m->off && fps >= 1.1 * min_fps) {
+            say("%.1f rendered fps, above min_fps %.0f again: frame generation back on", fps, min_fps);
+            m->off = false;
+        } else if (!m->off && fps < min_fps && !held) {
+            if (++m->below >= 2) {
+                say("%.1f rendered fps, below min_fps %.0f: frame generation off", fps, min_fps);
+                m->off = true;
+            }
+        } else {
+            m->below = 0;
+        }
+    }
+    m->win_t = t;
+    m->win_n = 1;
+    m->win_shown = 0;
+    return m->off;
+}
+
+// Frames shown per rendered one for this present
+static int multiplier_now(struct swapchain *sc, double t, const struct config *c)
+{
+    float hz = 0;
+    if (!c->multiplier || c->min_fps > 0)
+        hz = c->refresh > 0 ? c->refresh : display_refresh(sc, t);
+    if (below_min_fps(sc, t, c->min_fps, hz))
+        return 1;
+    if (c->multiplier)
+        return c->multiplier;
+    int most = MAX_GEN + 1;
+    // without a known refresh rate, the one pace() measures
+    float shown_hz = hz > 0 ? hz : sc->pace.hz_t >= 3.0 ? sc->pace.hz_shown / sc->pace.hz_t : 0;
+    if (c->min_fps > 0 && shown_hz > 0 && shown_hz / c->min_fps < most)
+        most = shown_hz / c->min_fps < 1 ? 1 : (int)(shown_hz / c->min_fps);
+    return pace(sc, t, hz, most);
+}
+
 static void present_image(struct swapchain *sc, VkQueue queue, uint32_t image, VkSemaphore wait)
 {
     VkPresentInfoKHR pi = {
@@ -1891,8 +1983,7 @@ static VkResult present_frames(VkQueue queue, const VkPresentInfoKHR *pi, struct
         return d->QueuePresentKHR(queue, pi);
     VkDevice dev = d->handle;
     struct config c = config_get();
-    double now = now_s();
-    int mult = c.multiplier ? c.multiplier : pace(sc, now, c.refresh > 0 ? c.refresh : display_refresh(sc, now));
+    int mult = multiplier_now(sc, now_s(), &c);
     status_write(mult);
     if (sc->rec)
         rec_poll(sc, false);

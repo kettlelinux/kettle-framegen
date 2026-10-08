@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: BSD-3-Clause
-// Tests for multiplier = auto (framegen.c's pace()) against a simulated game and FIFO display.
+// Tests for multiplier = auto (framegen.c's pace()) and min_fps against a simulated game and FIFO
+// display.
 //
 //   pacetest [-v]
 //
@@ -12,12 +13,13 @@
 
 struct sim {
     double hz;        // the display's refresh rate
-    float refresh;    // the "refresh" setting, 0 to measure it
+    struct config cfg;  // multiplier (0: auto), refresh (0: measure it), min_fps
     double fps;       // the most the game renders
     int max_shown;    // frames a present can show (spare images), 0 for no limit
     double t;
     struct swapchain sc;
     double at[MAX_GEN + 2];  // seconds spent at each multiplier
+    int n;                   // the multiplier last returned
     int changes, downs;      // multiplier changes, and those down
 };
 
@@ -25,7 +27,7 @@ static void sim_init(struct sim *s, double hz, float refresh, double fps)
 {
     memset(s, 0, sizeof(*s));
     s->hz = hz;
-    s->refresh = refresh;
+    s->cfg.refresh = refresh;
     s->fps = fps;
     s->t = 100.0;
 }
@@ -35,17 +37,19 @@ static int sim_run(struct sim *s, double until)
 {
     int n = 0;
     while (s->t < 100.0 + until) {
-        int prev = s->sc.pace.n;
-        n = pace(&s->sc, s->t, s->refresh);
-        if (prev && n != prev) {
+        n = multiplier_now(&s->sc, s->t, &s->cfg);
+        if (s->n && n != s->n) {
             s->changes++;
-            s->downs += n < prev;
+            s->downs += n < s->n;
         }
+        s->n = n;
         int shown = s->max_shown && n > s->max_shown ? s->max_shown : n;
         double game = 1.0 / s->fps, shown_t = shown / s->hz;
         double dt = game > shown_t ? game : shown_t;
         s->sc.pace.waited_ns += (uint64_t)((dt - game) * 1e9);
         s->sc.pace.win_shown += shown;
+        s->sc.floor.waited_ns += (uint64_t)((dt - game) * 1e9);
+        s->sc.floor.win_shown += shown;
         s->at[n] += dt;
         s->t += dt;
     }
@@ -119,6 +123,59 @@ int main(int argc, char **argv)
     n = sim_run(&s, 600);
     check("70 fps at 180 Hz, images for 2x: 2x", n == 2 && share(&s, 3) < 0.05 &&
           s.sc.pace.cap_wait > PACE_TRY, &s);
+
+    // min_fps: a game too slow for it gets no generated frames, within a few seconds
+    sim_init(&s, 60, 60, 25);
+    s.cfg.min_fps = 30;
+    n = sim_run(&s, 60);
+    check("25 fps at 60 Hz, min_fps 30: 1x", n == 1 && share(&s, 1) > 0.9 && s.changes <= 2, &s);
+
+    // ...and gets them back when it speeds up; the auto multiplier carries on from there
+    s.fps = 50;
+    n = sim_run(&s, 180);
+    check("25 then 50 fps at 60 Hz, min_fps 30: then 2x", n == 2, &s);
+
+    // the same where the refresh rate is measured (no present timing, no refresh setting)
+    sim_init(&s, 60, 0, 25);
+    s.cfg.min_fps = 30;
+    n = sim_run(&s, 60);
+    check("25 fps at 60 Hz, refresh measured, min_fps 30: 1x", n == 1 && share(&s, 1) > 0.8, &s);
+
+    // auto doesn't hold a game below the floor: 3x would hold it at 20 fps on 60 Hz
+    sim_init(&s, 60, 60, 40);
+    s.cfg.min_fps = 30;
+    n = sim_run(&s, 120);
+    check("40 fps at 60 Hz, min_fps 30: 2x, never 3x", n == 2 && share(&s, 3) == 0, &s);
+
+    // just above the floor: generation stays on
+    sim_init(&s, 75, 75, 31);
+    s.cfg.multiplier = 2;
+    s.cfg.min_fps = 30;
+    n = sim_run(&s, 60);
+    check("31 fps at 75 Hz, 2x, min_fps 30: 2x", n == 2 && s.changes == 0, &s);
+
+    // off below the floor, and not back on until a tenth above it
+    s.fps = 27;
+    bool off = sim_run(&s, 90) == 1;
+    s.fps = 32;
+    bool stays = sim_run(&s, 120) == 1;
+    s.fps = 34;
+    n = sim_run(&s, 150);
+    check("31, 27, 32, 34 fps at 75 Hz, 2x, min_fps 30: 2x, 1x, 1x, 2x", off && stays && n == 2 && s.changes == 2, &s);
+
+    // with a fixed multiplier and the refresh rate measured
+    sim_init(&s, 60, 0, 25);
+    s.cfg.multiplier = 2;
+    s.cfg.min_fps = 30;
+    n = sim_run(&s, 60);
+    check("25 fps at 60 Hz, 2x, refresh measured, min_fps 30: 1x", n == 1 && s.changes == 1, &s);
+
+    // 3x holds a faster game at 20 fps: it could go faster, so the floor doesn't apply
+    sim_init(&s, 60, 0, 100);
+    s.cfg.multiplier = 3;
+    s.cfg.min_fps = 30;
+    n = sim_run(&s, 60);
+    check("100 fps at 60 Hz, 3x (held at 20 fps), min_fps 30: 3x", n == 3 && s.changes == 0, &s);
 
     printf("%d of %d pacing tests passed\n", run_n - failed, run_n);
     return failed != 0;

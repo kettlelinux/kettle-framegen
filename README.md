@@ -175,6 +175,7 @@ example `KETTLE_FG_MULTIPLIER=3`) overrides the file.
 | --- | --- | --- |
 | `multiplier` | `2` | Frames shown per rendered frame, 1 to 3, or `auto` (below). `1` turns generation off. |
 | `refresh` | from the display | Display refresh rate in Hz, for `auto` (below). |
+| `min_fps` | `0` | Below this rendered frame rate, no generated frames (below). `0` sets no floor. |
 | `mode` | `motion` | `blend` mixes frames without motion estimation. |
 | `flow_scale` | `0.5` | Resolution of the motion estimate as a fraction of the frame, 0.1 to 1. |
 | `fifo` | `true` | Force FIFO presentation, also for games that pick a present mode per frame (DXVK, vkd3d-proton). Read when the swapchain is created. |
@@ -204,6 +205,15 @@ Snapdragon 8 Gen 3), the display tells `auto` its refresh rate and the log shows
 when the game waits for it and measures the refresh rate there, but a GPU-bound game also waits
 short of full, so `auto` can settle too low; with a frame limiter between the layer and the
 display, it measures the limit. A `refresh` setting always wins.
+
+With `min_fps` set, a game rendering below it gets no generated frames: each real frame waits
+for the next before the frames between can be made, so a slow game waits long, and its motion
+between frames is too far to follow well. Generation comes back once the game renders a tenth
+above the floor, so one sitting on it doesn't switch back and forth, and two seconds below it in
+a row are needed to turn it off, so a single hitch doesn't. The floor is judged on the rate the
+game renders at by itself: where FIFO holds it at refresh / multiplier, it could go faster, so a
+fixed multiplier that holds it below the floor (3x on 60 Hz holds it at 20 fps) is kept. `auto`
+never picks one that would. The log shows each change.
 
 Generated frames between two real ones need the later one rendered, so the game always runs a
 frame ahead of the display. Any further and its frames wait in the swapchain's queue, which is
