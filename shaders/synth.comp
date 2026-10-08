@@ -62,6 +62,7 @@ const float UNMATCHED = 0.06;  // block match cost from which its vectors are no
 const float EDGE = 4.0;        // block vectors this far apart (pixels): a figure's edge
 const int NC = 7;              // candidate vectors: here, the 4 nearest blocks, zero, one further off
 const mediump float POOR = 0.5;  // the best match cost from which those further off are tried
+const mediump float ZERO_MOVING = 0.5;  // the zero vector's extra cost where this pixel changed
 
 layout(push_constant) uniform PC {
     vec2 size;      // frame, pixels
@@ -258,8 +259,13 @@ void main()
         for (int k = 1; k < 6; k++)
             if (distance(cand[k], mean) < distance(cand[kb], mean))
                 kb = k;
+        // The zero vector is for what stays put over a moving scene (the HUD): only where this
+        // pixel is the same in both frames (still.comp) does it compete as it is. Elsewhere it
+        // matched moving ground by chance, in fine texture (dark ground in a turn in Skyrim on
+        // the Adreno 740, 30 fps), and each pixel that took it was a speck of other ground.
+        mediump float zero_bias = 0.08 + (texelFetch(hud, p, 0).r > 0.5 ? 0.0 : ZERO_MOVING);
         for (int k = 0; k < 6; k++) {
-            mediump float c = try_vector(q, cand[k], k == 0 ? 0.0 : k < 5 ? 0.04 : 0.08);
+            mediump float c = try_vector(q, cand[k], k == 0 ? 0.0 : k < 5 ? 0.04 : zero_bias);
             if (k == kb)
                 cost_b = c;
         }
