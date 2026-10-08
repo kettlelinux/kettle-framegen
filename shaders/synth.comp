@@ -60,7 +60,7 @@ layout(binding = 5) uniform sampler2D hud;  // still.comp: 1 where the frames ar
 const float LOST_FROM = 0.02, LOST_TO = 0.04;  // block match cost: motion followed .. lost
 const float UNMATCHED = 0.06;  // block match cost from which its vectors are no use at all
 const float EDGE = 4.0;        // block vectors this far apart (pixels): a figure's edge
-const int NC = 14;             // candidate vectors: here, the 4 nearest blocks, zero, 8 further off
+const int NC = 7;              // candidate vectors: here, the 4 nearest blocks, zero, one further off
 const mediump float POOR = 0.5;  // the best match cost from which those further off are tried
 
 layout(push_constant) uniform PC {
@@ -264,19 +264,27 @@ void main()
         // has no vector of its own: interpolated with the figure's, it shows both frames at
         // once (a ghosted strip along a sword as the camera turns, as wide as its motion).
         // Where nothing fits, the blocks one and two beyond the nearest on each side are tried
-        // too. That is a few percent of the pixels (in Skyrim 4-8%, along figures and in
-        // foliage), so the cost stays small.
-        for (int k = 6; k < NC; k++) {
-            cand[k] = cand[0];
-            cost[k] = 1e4;
-        }
+        // too: a few percent of the pixels (in Skyrim 4-8%, along figures and in foliage), but
+        // scattered, so many more pay for them (a GPU runs pixels in groups). Each is checked on
+        // this pixel alone, and only the best of them in full: in Skyrim that costs a fifth
+        // more GPU time here, where testing all eight in full cost two thirds more.
+        cand[6] = cand[0];
+        cost[6] = 1e4;
         if (best > POOR) {
-            for (int k = 6; k < NC; k++) {
-                int r = (k - 6) / 4 + 1, j = (k - 6) % 4;  // one block further off, then two
+            mediump float quick = 1e4;
+            for (int k = 0; k < 8; k++) {
+                int r = k / 4 + 1, j = k % 4;  // one block further off, then two
                 ivec2 o = ivec2(j == 0 ? -r : j == 1 ? r + 1 : 0, j == 2 ? -r : j == 3 ? r + 1 : 0);
-                cand[k] = texelFetch(mv, clamp(i + o, ivec2(0), last), 0).xy * pc.mv_to_px;
-                cost[k] = try_vector(q, cand[k], 0.06);
+                vec2 v = texelFetch(mv, clamp(i + o, ivec2(0), last), 0).xy * pc.mv_to_px;
+                vec2 qa = q - pc.t * v, qb = q + (1.0 - pc.t) * v;
+                mediump float e = inside(qa) && inside(qb)
+                    ? diff(textureLod(prev_img, qa * rcp, 0.0), textureLod(cur_img, qb * rcp, 0.0)) : 1e4;
+                if (e < quick) {
+                    quick = e;
+                    cand[6] = v;
+                }
             }
+            cost[6] = try_vector(q, cand[6], 0.06);
         }
     } else {
         try_vector(q, vec2(0.0), 0.0);
