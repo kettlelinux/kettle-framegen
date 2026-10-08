@@ -158,42 +158,37 @@ mediump float try_vector(vec2 q, vec2 v, mediump float bias)
     return c;
 }
 
-// Where the pixel at q is background hidden in one frame by a figure in front: that frame's
-// sample along the background vector vb is the figure, which moving on with vf turns up again
-// in the other frame. True when that settles it, with the other frame's sample in `shown`.
-bool uncovered(vec2 q, vec2 vb, vec2 vf, out mediump vec4 shown)
+// Where the pixel at q is background beside a figure, vb the background's vector and vf the
+// figure's, which frame shows it. Two tests:
+// - uncovered: the frame where it is hidden has the figure along vb, which moving on with vf
+//   turns up again in the other frame. `told` when that settles it, with the other frame's
+//   sample in `shown`.
+// - covers: the background moves by vb - vf against the figure, so where the figure lies ahead
+//   of q along that, the background runs into it and the previous frame shows it, else it comes
+//   out from behind it and the current frame does. The figure's side is the one whose block
+//   vectors are near vf. True when that settles it, with that frame's sample along vb in `side`.
+// The samples are all taken at once, so the GPU waits for them once: those along vb serve both.
+bool occlusion(vec2 q, vec2 vb, vec2 vf, out bool told, out mediump vec4 shown, out mediump vec4 side)
 {
-    vec2 qa = q - pc.t * vb, qb = q + (1.0 - pc.t) * vb;
-    if (!inside(qa) || !inside(qb))
-        return false;
     vec2 rcp = 1.0 / pc.size;
-    mediump vec4 pa = textureLod(prev_img, qa * rcp, 0.0), pb = textureLod(cur_img, qb * rcp, 0.0);
-    bool a_hidden = inside(qa + vf) && diff(pa, textureLod(cur_img, (qa + vf) * rcp, 0.0)) < 0.12;
-    bool b_hidden = inside(qb - vf) && diff(pb, textureLod(prev_img, (qb - vf) * rcp, 0.0)) < 0.12;
-    shown = a_hidden ? pb : pa;
-    return a_hidden != b_hidden;
-}
-
-// Where the pixel at q is background beside a figure: the background moves by vb - vf against
-// it, so where the figure lies ahead of q along that, the background runs into it and the
-// previous frame shows it, else it comes out from behind it and the current frame does. The
-// figure's side is the one whose block vectors are near vf. True when that settles it, with
-// that frame's sample along vb in `shown`.
-bool covers(vec2 q, vec2 vb, vec2 vf, out mediump vec4 shown)
-{
+    vec2 qa = q - pc.t * vb, qb = q + (1.0 - pc.t) * vb;
     vec2 r = vb - vf;
     // past the block at the figure's edge, whose vector is neither's
     vec2 d = normalize(r) * max(1.5 * pc.size.x / float(textureSize(mv, 0).x), 0.5 * length(r));
     vec2 c = q - (pc.t - 0.5) * vf;  // the field has the figure where it is at t = 0.5
+    mediump vec4 pa = textureLod(prev_img, qa * rcp, 0.0), pb = textureLod(cur_img, qb * rcp, 0.0);
+    mediump vec4 fa = textureLod(cur_img, (qa + vf) * rcp, 0.0), fb = textureLod(prev_img, (qb - vf) * rcp, 0.0);
     float ahead = distance(textureLod(mv, (c + d) * pc.mv_uv, 0.0).xy * pc.mv_to_px, vf);
     float behind = distance(textureLod(mv, (c - d) * pc.mv_uv, 0.0).xy * pc.mv_to_px, vf);
+
+    bool a_hidden = inside(qa + vf) && diff(pa, fa) < 0.12;
+    bool b_hidden = inside(qb - vf) && diff(pb, fb) < 0.12;
+    told = inside(qa) && inside(qb) && a_hidden != b_hidden;
+    shown = a_hidden ? pb : pa;
+
     bool before = ahead < behind;
-    vec2 qs = before ? q - pc.t * vb : q + (1.0 - pc.t) * vb;
-    if (!inside(qs) || abs(ahead - behind) < 1.0 || min(ahead, behind) > max(1.0, 0.25 * length(r)))
-        return false;
-    vec2 rcp = 1.0 / pc.size;
-    shown = before ? textureLod(prev_img, qs * rcp, 0.0) : textureLod(cur_img, qs * rcp, 0.0);
-    return true;
+    side = before ? pa : pb;
+    return inside(before ? qa : qb) && abs(ahead - behind) >= 1.0 && min(ahead, behind) <= max(1.0, 0.25 * length(r));
 }
 
 void main()
@@ -214,7 +209,10 @@ void main()
     }
     mean = vec2(cut.sum) / (16.0 * float(grid.x * grid.y)) * pc.mv_to_px;
     vec2 cand[NC];  // the block field here, the four nearest blocks, zero, blocks further off
-    mediump float cost[NC];
+    // background: the candidate nearest the mean motion, and its match. Only its match is kept,
+    // not each candidate's: on a GPU with few registers (Adreno) more pixels run at once.
+    int kb = 0;
+    mediump float cost_b = 1e4;
     float spread = 0.0;  // how far apart the nearest blocks' vectors are from the field here
     float matched = 1.0;  // the best match cost around (filter.comp: of 3x3 blocks), interpolated
     vec2 rcp = 1.0 / pc.size, dx = vec2(1.0, 0.0);
@@ -257,8 +255,14 @@ void main()
         // where that frame had it (a halo growing with the speed)
         lost *= 1.0 - smoothstep(EDGE, 2.0 * EDGE, spread);
         cand[5] = vec2(0.0);
-        for (int k = 0; k < 6; k++)
-            cost[k] = try_vector(q, cand[k], k == 0 ? 0.0 : k < 5 ? 0.04 : 0.08);
+        for (int k = 1; k < 6; k++)
+            if (distance(cand[k], mean) < distance(cand[kb], mean))
+                kb = k;
+        for (int k = 0; k < 6; k++) {
+            mediump float c = try_vector(q, cand[k], k == 0 ? 0.0 : k < 5 ? 0.04 : 0.08);
+            if (k == kb)
+                cost_b = c;
+        }
         // Beside a figure, the blocks at its edge take its vector (most of their pixels are
         // the figure's), so the nearest four can all be the figure's and the background there
         // has no vector of its own: interpolated with the figure's, it shows both frames at
@@ -268,23 +272,31 @@ void main()
         // scattered, so many more pay for them (a GPU runs pixels in groups). Each is checked on
         // this pixel alone, and only the best of them in full: in Skyrim that costs a fifth
         // more GPU time here, where testing all eight in full cost two thirds more.
+        // The vectors are all fetched before any sample along them, so the GPU waits for them
+        // once rather than eight times in turn.
         cand[6] = cand[0];
-        cost[6] = 1e4;
         if (best > POOR) {
-            mediump float quick = 1e4;
+            vec2 far[8];
             for (int k = 0; k < 8; k++) {
                 int r = k / 4 + 1, j = k % 4;  // one block further off, then two
                 ivec2 o = ivec2(j == 0 ? -r : j == 1 ? r + 1 : 0, j == 2 ? -r : j == 3 ? r + 1 : 0);
-                vec2 v = texelFetch(mv, clamp(i + o, ivec2(0), last), 0).xy * pc.mv_to_px;
-                vec2 qa = q - pc.t * v, qb = q + (1.0 - pc.t) * v;
+                far[k] = texelFetch(mv, clamp(i + o, ivec2(0), last), 0).xy * pc.mv_to_px;
+            }
+            mediump float quick = 1e4;
+            for (int k = 0; k < 8; k++) {
+                vec2 qa = q - pc.t * far[k], qb = q + (1.0 - pc.t) * far[k];
                 mediump float e = inside(qa) && inside(qb)
                     ? diff(textureLod(prev_img, qa * rcp, 0.0), textureLod(cur_img, qb * rcp, 0.0)) : 1e4;
                 if (e < quick) {
                     quick = e;
-                    cand[6] = v;
+                    cand[6] = far[k];
                 }
             }
-            cost[6] = try_vector(q, cand[6], 0.06);
+            mediump float c = try_vector(q, cand[6], 0.06);
+            if (distance(cand[6], mean) < distance(cand[kb], mean)) {
+                kb = 6;
+                cost_b = c;
+            }
         }
     } else {
         try_vector(q, vec2(0.0), 0.0);
@@ -293,11 +305,7 @@ void main()
     mediump float w = flow ? smoothstep(0.08, 0.25, max(d.r, max(d.g, d.b))) : 0.0;
     mediump vec4 alone = pc.t < 0.5 ? a : b;
     if (flow) {
-        // background: the candidate nearest the mean motion; figure: the one farthest from it
-        int kb = 0;
-        for (int k = 1; k < NC; k++)
-            if (distance(cand[k], mean) < distance(cand[kb], mean))
-                kb = k;
+        // figure: the candidate farthest from the background's (kb, above)
         vec2 vb = cand[kb], vf = cand[0];
         for (int k = 0; k < NC; k++)
             if (distance(cand[k], vb) > distance(vf, vb))
@@ -305,16 +313,16 @@ void main()
         // where the background's own vector fails, it is hidden in one frame, and when the
         // figure is found there, what any vector matched instead was chance (specks beside
         // thin figures): the frame showing the background is used
-        mediump float occ = smoothstep(0.5, 0.7, cost[kb]) * smoothstep(0.2, 0.4, figure);
-        mediump vec4 shown;
+        mediump float occ = smoothstep(0.5, 0.7, cost_b) * smoothstep(0.2, 0.4, figure);
         if ((w > 0.0 || occ > 0.0) && distance(vf, vb) > 1.0) {
             // the colour test says whether it is hidden; the figure's side, where it can,
             // which frame shows it
-            bool told = uncovered(q, vb, vf, shown);
+            bool told;
+            mediump vec4 shown, side;
+            bool on_side = occlusion(q, vb, vf, told, shown, side);
             if (told)
                 w = max(w, occ);
-            mediump vec4 side;
-            alone = covers(q, vb, vf, side) ? side : told ? shown : alone;
+            alone = on_side ? side : told ? shown : alone;
         }
     }
     mediump vec4 c = mix(mix(a, b, pc.t), alone, w);
