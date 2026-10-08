@@ -3,7 +3,7 @@
 // luma0 -> down -> motion -> filter -> synth on a headless Vulkan device, as the layer does on
 // each present, and compares the generated frames with stored references.
 //
-//   fgtest [-d device] [-o outdir] [-u] case...
+//   fgtest [-d device] [-o outdir] [-u] [-t reps] case...
 //
 // A case is a directory holding
 //   0.ppm, 1.ppm, ...  the rendered frames, in order (binary PPM, 8 bits); at least two
@@ -24,7 +24,9 @@
 //
 // -u writes the outputs as the new references. -o writes the outputs, and a 4x amplified
 // difference image beside each one that fails, to outdir/<case>/. -d picks the physical device
-// by index (default: the first; FGTEST_DEVICE works too).
+// by index (default: the first; FGTEST_DEVICE works too). -t runs each frame reps times and
+// prints the GPU time of each stage per generated frame, the fastest of the runs, for comparing
+// shader changes on the same frames.
 #include <math.h>
 #include <stdbool.h>
 #include <stdint.h>
@@ -52,6 +54,8 @@ static VkDescriptorSetLayout dsl[NPIPE];
 static VkPipelineLayout layout[NPIPE];
 static VkPipeline pipeline[NPIPE];
 static VkCommandPool pool;
+static float ts_period;  // ns per timestamp tick, 0: the queue has no timestamps
+static int reps;         // -t: runs of each frame, 0: not timed
 
 #define CHECK(x)                                                                         \
     do {                                                                                 \
@@ -168,6 +172,7 @@ static void device_init(int index)
     vkGetPhysicalDeviceProperties(phys, &props);
     vkGetPhysicalDeviceMemoryProperties(phys, &memprops);
     printf("device: %s\n", props.deviceName);
+    ts_period = props.limits.timestampPeriod;
 
     VkQueueFamilyProperties fams[32];
     uint32_t nf = 32;
@@ -178,6 +183,8 @@ static void device_init(int index)
         fprintf(stderr, "fgtest: the device has no compute queue\n");
         exit(2);
     }
+    if (!fams[family].timestampValidBits)
+        ts_period = 0;
     float prio = 1.0f;
     VkDeviceQueueCreateInfo qci = { .sType = VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO, .queueFamilyIndex = family,
                                     .queueCount = 1, .pQueuePriorities = &prio };
@@ -235,6 +242,10 @@ static void device_free(void)
 
 // ---------- one case's resources, as framegen.c's flow_build ----------
 
+// GPU timestamps in frame(), for -t: before the pyramid, then after each stage
+enum { ST_START, ST_PYRAMID, ST_MOTION, ST_FILTER, ST_SYNTH, NSTAMP };
+static const char *const stage_names[NSTAMP] = { NULL, "pyramid", "motion", "filter+still", "synth" };
+
 struct img {
     VkImage image;
     VkDeviceMemory mem;
@@ -258,6 +269,7 @@ struct run {
     VkDescriptorSet ds_luma[2], ds_down[2][MAX_LEVELS], ds_motion[2][MAX_LEVELS], ds_filter[2], ds_still[2];
     VkDescriptorSet ds_synth[2][MAX_GEN];
     VkCommandBuffer cmd;
+    VkQueryPool queries;
     VkFence fence;
 };
 
@@ -416,11 +428,17 @@ static void run_create(struct run *R, VkExtent2D full, float flow_scale)
     CHECK(vkAllocateCommandBuffers(dev, &cai, &R->cmd));
     VkFenceCreateInfo fi = { .sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO };
     CHECK(vkCreateFence(dev, &fi, NULL, &R->fence));
+    VkQueryPoolCreateInfo qi = { .sType = VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO,
+                                 .queryType = VK_QUERY_TYPE_TIMESTAMP, .queryCount = NSTAMP };
+    if (reps > 0 && ts_period)
+        CHECK(vkCreateQueryPool(dev, &qi, NULL, &R->queries));
 }
 
 static void run_free(struct run *R)
 {
     vkDestroyFence(dev, R->fence, NULL);
+    if (R->queries)
+        vkDestroyQueryPool(dev, R->queries, NULL);
     vkFreeCommandBuffers(dev, pool, 1, &R->cmd);
     vkDestroyDescriptorPool(dev, R->dpool, NULL);
     for (int s = 0; s < 2; s++) {
@@ -441,6 +459,12 @@ static void run_free(struct run *R)
 }
 
 // ---------- per frame, as framegen.c's record ----------
+
+static void stamp(struct run *R, VkCommandBuffer cmd, int i)
+{
+    if (R->queries)
+        vkCmdWriteTimestamp(cmd, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, R->queries, i);
+}
 
 static void barrier(VkCommandBuffer cmd, VkPipelineStageFlags src, VkAccessFlags sa, VkPipelineStageFlags dst,
                     VkAccessFlags da)
@@ -511,6 +535,9 @@ static void frame(struct run *R, const struct pic *pic, int c, bool first, uint3
         vkCmdFillBuffer(cmd, R->cut.buffer, 0, VK_WHOLE_SIZE, 0);
     barrier(cmd, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_TRANSFER_WRITE_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
             VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT);
+    if (R->queries)
+        vkCmdResetQueryPool(cmd, R->queries, 0, NSTAMP);
+    stamp(R, cmd, ST_START);
 
     // 2. its luma pyramid
     int32_t bgr = 0;
@@ -521,6 +548,7 @@ static void frame(struct run *R, const struct pic *pic, int c, bool first, uint3
         dispatch(cmd, P_DOWN, R->ds_down[c][l], &src, sizeof(src), R->luma[l]);
     }
     compute_to_compute(cmd);
+    stamp(R, cmd, ST_PYRAMID);
 
     if (ngen) {
         // 3. motion, coarse to fine, then the median filter into mvf[c]
@@ -530,15 +558,20 @@ static void frame(struct run *R, const struct pic *pic, int c, bool first, uint3
                 dispatch(cmd, P_MOTION, R->ds_motion[c][l], &pc, sizeof(pc), R->mv[l]);
                 compute_to_compute(cmd);
             }
+            stamp(R, cmd, ST_MOTION);
             dispatch(cmd, P_FILTER, R->ds_filter[c], NULL, 0, R->mv[0]);
             dispatch(cmd, P_STILL, R->ds_still[c], NULL, 0, full);
             compute_to_compute(cmd);
+        } else {
+            stamp(R, cmd, ST_MOTION);
         }
+        stamp(R, cmd, ST_FILTER);
         // 4. the in-between frames
         for (uint32_t k = 0; k < ngen; k++) {
             struct synth_pc pc = synth_push(full, R->luma, R->mv, (k + 1.0f) / multiplier, flow, false);
             dispatch(cmd, P_SYNTH, R->ds_synth[c][k], &pc, sizeof(pc), full);
         }
+        stamp(R, cmd, ST_SYNTH);
         barrier(cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_ACCESS_SHADER_WRITE_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT,
                 VK_ACCESS_TRANSFER_READ_BIT);
         VkDeviceSize one = (VkDeviceSize)full.width * full.height * 4;
@@ -556,6 +589,18 @@ static void frame(struct run *R, const struct pic *pic, int c, bool first, uint3
     CHECK(vkResetFences(dev, 1, &R->fence));
     CHECK(vkQueueSubmit(queue, 1, &si, R->fence));
     CHECK(vkWaitForFences(dev, 1, &R->fence, VK_TRUE, UINT64_MAX));
+}
+
+// For -t: each stage's GPU time in the frame just run, ms
+static bool stage_ms(struct run *R, double ms[NSTAMP])
+{
+    uint64_t t[NSTAMP];
+    if (!R->queries || vkGetQueryPoolResults(dev, R->queries, 0, NSTAMP, sizeof(t), t, sizeof(*t),
+                                             VK_QUERY_RESULT_64_BIT) != VK_SUCCESS)
+        return false;
+    for (int i = 1; i < NSTAMP; i++)
+        ms[i] = (t[i] - t[i - 1]) * ts_period * 1e-6;
+    return true;
 }
 
 // ---------- comparison ----------
@@ -649,7 +694,8 @@ static int run_case(const char *dir, const char *outdir, bool update)
 
     struct run R;
     struct pic pic = { 0 }, gen = { 0 }, ref = { 0 }, amp = { 0 };
-    int result = 0, nframes = 0;
+    int result = 0, nframes = 0, timed = 0;
+    double total[NSTAMP] = { 0 };  // -t: summed over the generated frames, the fastest run of each
     for (;; nframes++) {
         snprintf(path, sizeof(path), "%s/%d.ppm", dir, nframes);
         if (!exists(path))
@@ -675,6 +721,21 @@ static int run_case(const char *dir, const char *outdir, bool update)
         // previous pair's vectors seed this one's search
         int c = nframes & 1;
         frame(&R, &pic, c, nframes == 0, ngen, cf.multiplier, cf.flow, cf.flow && nframes >= 2);
+        if (ngen && reps > 0) {
+            // the same frame again (the other slot, the previous frame and its vectors are as they
+            // were), keeping each stage's fastest
+            double best[NSTAMP], ms[NSTAMP];
+            bool ok = stage_ms(&R, best);
+            for (int r = 1; ok && r < reps; r++) {
+                frame(&R, &pic, c, false, ngen, cf.multiplier, cf.flow, cf.flow && nframes >= 2);
+                ok = stage_ms(&R, ms);
+                for (int i = 1; i < NSTAMP; i++)
+                    best[i] = fmin(best[i], ms[i]);
+            }
+            for (int i = 1; ok && i < NSTAMP; i++)
+                total[i] += best[i];
+            timed += ok;
+        }
         uint32_t cut = *(uint32_t *)((uint8_t *)R.down.map + (size_t)pic.w * pic.h * 4 * MAX_GEN);
 
         for (uint32_t k = 0; k < ngen; k++) {
@@ -734,6 +795,17 @@ static int run_case(const char *dir, const char *outdir, bool update)
         if (result == 2)
             break;
     }
+    if (timed) {
+        double all = 0;
+        printf("%-15s GPU ms per pair:", name);
+        for (int i = 1; i < NSTAMP; i++) {
+            printf(" %s %.3f", stage_names[i], total[i] / timed);
+            all += total[i] / timed;
+        }
+        printf(", all %.3f\n", all);
+    } else if (reps > 0) {
+        printf("%-15s no GPU timestamps on this device\n", name);
+    }
     if (nframes > 0)
         run_free(&R);
     if (nframes < 2 && result == 0) {
@@ -752,13 +824,15 @@ int main(int argc, char **argv)
     const char *outdir = NULL, *env = getenv("FGTEST_DEVICE");
     int device = env ? atoi(env) : 0, opt;
     bool update = false;
-    while ((opt = getopt(argc, argv, "d:o:u")) != -1) {
+    while ((opt = getopt(argc, argv, "d:o:ut:")) != -1) {
         if (opt == 'd')
             device = atoi(optarg);
         else if (opt == 'o')
             outdir = optarg;
         else if (opt == 'u')
             update = true;
+        else if (opt == 't')
+            reps = atoi(optarg);
         else
             goto usage;
     }
@@ -778,6 +852,6 @@ int main(int argc, char **argv)
         printf("%d of %d cases passed\n", argc - optind - failed, argc - optind);
     return worst;
 usage:
-    fprintf(stderr, "usage: %s [-d device] [-o outdir] [-u] case...\n", argv[0]);
+    fprintf(stderr, "usage: %s [-d device] [-o outdir] [-u] [-t reps] case...\n", argv[0]);
     return 2;
 }
