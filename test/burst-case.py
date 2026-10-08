@@ -3,15 +3,17 @@
 # Makes a test case with a truth from a burst of real frames (`burst = <n>` with `dump = <dir>`
 # in the game's settings, see the README): frames 0, 2, 4, ... of the burst become the case's
 # 0.ppm, 1.ppm, 2.ppm, ... and frames 1, 3, ... the truth for the frame generated between their
-# neighbours (truth/1-1.ppm, truth/2-1.ppm, ...).
+# neighbours (truth/1-1.ppm, truth/2-1.ppm, ...). A recording (`record = <s>`) works too: its
+# real frames are the game's frames in a row, as a burst's are (its generated ones are left out).
 #
-#   test/burst-case.py [--crop WxH+X+Y] [--first N] <dump dir> test/cases/<name>
+#   test/burst-case.py [--crop WxH+X+Y] [--first N] [--frames N] <dump dir> test/cases/<name>
 #   make test-update CASES=test/cases/<name>
 #
 # --crop keeps a part of each frame (a full 3440x1440 frame is 15 MB): the part that shows what
 # the case is about, with room around it for the motion. Its edges become the frame's edges, and
 # the share of unmatched blocks (scene cut, lost motion) is the crop's, not the frame's.
-# --first picks the burst by its first present number where the directory holds several.
+# --first picks the burst by its first present number where the directory holds several, and
+# --frames takes that many real frames from it (odd, at least 3; a recording holds hundreds).
 # Python's standard library only.
 import argparse
 import os
@@ -53,6 +55,7 @@ def main():
     ap = argparse.ArgumentParser(description='Make a test case with a truth from a burst of real frames.')
     ap.add_argument('--crop', help='WxH+X+Y: keep this part of each frame')
     ap.add_argument('--first', type=int, help='present number of the burst\'s first frame')
+    ap.add_argument('--frames', type=int, help='real frames to take (odd, at least 3)')
     ap.add_argument('dump')
     ap.add_argument('case')
     a = ap.parse_args()
@@ -65,18 +68,27 @@ def main():
         box = tuple(int(v) for v in m.groups())
 
     found = {}
-    for name in os.listdir(a.dump):
-        m = re.fullmatch(r'kettle-fg-real-(\d+)\.ppm', name)
-        if m:
-            found[int(m.group(1))] = os.path.join(a.dump, name)
+    rec = os.path.join(a.dump, 'kettle-fg-rec.txt')
+    if os.path.exists(rec):
+        # a recording: "<frame> <present> <queued ms> real|gen k/n" per frame shown
+        with open(rec) as f:
+            for line in f:
+                v = line.split()
+                if len(v) >= 4 and not line.startswith('#') and v[3] == 'real':
+                    found[int(v[1])] = os.path.join(a.dump, f'kettle-fg-rec-{v[0]}.ppm')
+    else:
+        for name in os.listdir(a.dump):
+            m = re.fullmatch(r'kettle-fg-real-(\d+)\.ppm', name)
+            if m:
+                found[int(m.group(1))] = os.path.join(a.dump, name)
     if not found:
-        sys.exit(f'{a.dump}: no kettle-fg-real-<present>.ppm')
+        sys.exit(f'{a.dump}: no kettle-fg-real-<present>.ppm or kettle-fg-rec.txt')
     # the burst: consecutive presents from the first asked for, or the earliest
     first = a.first if a.first is not None else min(found)
     if first not in found:
         sys.exit(f'{a.dump}: no frame from present {first}')
     run = []
-    while first + len(run) in found:
+    while first + len(run) in found and (a.frames is None or len(run) < a.frames):
         run.append(found[first + len(run)])
     if len(run) < 3:
         sys.exit(f'{a.dump}: {len(run)} frames in a row from present {first}, a case needs at least 3')

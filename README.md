@@ -76,7 +76,7 @@ device: llvmpipe (LLVM 21.1.8, 256 bits)
 ...
 object          1-1   cut  0.7%  truth  32.19 dB  ref  63.97 dB   0.00% off  ok
 ...
-19 of 19 cases passed
+20 of 20 cases passed
 ```
 
 Per generated frame: the share of blocks no vector matched (above 30% counts as a scene cut),
@@ -109,7 +109,11 @@ test/burst-case.py --crop 960x540+1240+450 <dump dir> test/cases/<name>
 make test-update CASES=test/cases/<name>
 ```
 
-The motion between them is twice the game's, so they are harder than the game itself.
+The motion between them is twice the game's, so they are harder than the game itself. A
+recording (below) works as a burst too: its real frames are the game's frames in a row, and
+`--first <present> --frames <n>` picks a stretch of it. Keep the crop wide enough that most of
+its blocks still match (the `cut` share stays under 15%), or the case tests the fallback for
+lost motion rather than the frame generation.
 
 ### Recording what the display shows
 
