@@ -1189,7 +1189,8 @@ static void burst_free(struct swapchain *sc)
     VkDevice dev = d->handle;
     for (uint32_t i = 0; i < MAX_BURST; i++) {
         if (sc->burst.fence[i]) {
-            d->WaitForFences(dev, 1, &sc->burst.fence[i], VK_TRUE, UINT64_MAX);
+            if (i < sc->burst.i)  // submitted; the others never signal
+                d->WaitForFences(dev, 1, &sc->burst.fence[i], VK_TRUE, UINT64_MAX);
             d->DestroyFence(dev, sc->burst.fence[i], NULL);
         }
         if (sc->burst.cmd[i])
