@@ -647,6 +647,14 @@ struct conf {
     double min_psnr, max_bad;
 };
 
+// The whole of v as a number, or false (not 0, which would make a tolerance pass anything)
+static bool number(const char *v, double *out)
+{
+    char *end;
+    *out = strtod(v, &end);
+    return end != v && !*end && isfinite(*out);
+}
+
 static bool conf_read(const char *dir, struct conf *c)
 {
     *c = (struct conf){ .multiplier = 2, .flow_scale = 0.5f, .flow = true, .min_psnr = 35.0, .max_bad = 0.01 };
@@ -658,18 +666,22 @@ static bool conf_read(const char *dir, struct conf *c)
     bool ok = true;
     while (fgets(line, sizeof(line), f)) {
         char k[64], v[64];
+        double x = 0.0;
         if (line[strspn(line, " \t")] == '#' || sscanf(line, " %63[^= \t] = %63s", k, v) != 2)
             continue;
-        if (!strcmp(k, "multiplier"))
-            c->multiplier = atoi(v);
+        if (strcmp(k, "mode") && !number(v, &x)) {
+            fprintf(stderr, "fgtest: %s: %s = %s is not a number\n", path, k, v);
+            ok = false;
+        } else if (!strcmp(k, "multiplier"))
+            c->multiplier = x == (int)x ? (int)x : 0;
         else if (!strcmp(k, "flow_scale"))
-            c->flow_scale = strtof(v, NULL);
+            c->flow_scale = (float)x;
         else if (!strcmp(k, "mode"))
             c->flow = strcmp(v, "blend") != 0;
         else if (!strcmp(k, "min_psnr"))
-            c->min_psnr = strtod(v, NULL);
+            c->min_psnr = x;
         else if (!strcmp(k, "max_bad"))
-            c->max_bad = strtod(v, NULL);
+            c->max_bad = x;
         else {
             fprintf(stderr, "fgtest: %s: unknown key %s\n", path, k);
             ok = false;
