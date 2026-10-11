@@ -66,6 +66,7 @@ const mediump float POOR = 0.5;  // the best match cost from which those further
 const mediump float ZERO_MOVING = 0.5;  // the zero vector's extra cost where this pixel changed
 const mediump float HUD_LATELY = 0.75;  // still.comp's .g from which a pixel counts as the HUD
 const mediump float SLIDE_GAIN = 0.15;  // slide.comp's vector is taken where it matches within this of the best
+const float SLIDE_AREA = 0.4;  // slide.comp's .w from which the HUD slid here lately
 
 layout(push_constant) uniform PC {
     vec2 size;      // frame, pixels
@@ -323,12 +324,19 @@ void main()
         // and the still HUD, would drag the letters back along with it.
         mediump float slide_best = 1e4;
         // one filtered read tells whether any of the four found something (most pixels: none)
-        bool any_slide = textureLod(slide, q * pc.mv_uv, 0.0).z > 0.0;
+        vec4 near = textureLod(slide, q * pc.mv_uv, 0.0);
+        bool any_slide = near.z > 0.0 || near.w > SLIDE_AREA;
         for (int k = 0; k < 4 && any_slide; k++) {
-            vec4 m = texelFetch(slide, clamp(i + ivec2(k & 1, k >> 1), ivec2(0), last), 0);
-            if (m.z < 0.5)
-                continue;
+            ivec2 j = clamp(i + ivec2(k & 1, k >> 1), ivec2(0), last);
+            vec4 m = texelFetch(slide, j, 0);
             vec2 v = m.xy;
+            if (m.z < 0.5) {
+                // where the HUD slid lately, a block whose own vector moves unlike the camera has
+                // the HUD's motion too (a compass marker the motion search followed)
+                v = cand[k + 1];
+                if (m.w < SLIDE_AREA || distance(v, mean) < 8.0 || abs(v.x) < 4.0)
+                    continue;
+            }
             vec2 qa = q - pc.t * v, qb = q + (1.0 - pc.t) * v;
             // still HUD doesn't slide (text over a scene the search can't follow)
             if (!inside(qa) || !inside(qb) || textureLod(hud, qa * rcp, 0.0).r > 0.5 ||
