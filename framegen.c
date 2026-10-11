@@ -523,11 +523,12 @@ static void *unlink_key(void **list, void *key)
 #define find_inst(k) ((struct inst *)find_key(insts, (k)))
 #define find_dev(k) ((struct dev *)find_key(devs, (k)))
 
-static struct swapchain *find_sc(VkSwapchainKHR h, bool unlink)
+// Non-dispatchable handles are only unique within their device
+static struct swapchain *find_sc(struct dev *d, VkSwapchainKHR h, bool unlink)
 {
     pthread_mutex_lock(&lock);
     struct swapchain **p = &swapchains, *s;
-    while ((s = *p) && s->handle != h)
+    while ((s = *p) && (s->handle != h || s->dev != d))
         p = &s->next;
     if (s && unlink)
         *p = s->next;
@@ -2168,7 +2169,8 @@ static VkResult present_frames(VkQueue queue, const VkPresentInfoKHR *pi, struct
 static VKAPI_ATTR VkResult VKAPI_CALL QueuePresentKHR(VkQueue queue, const VkPresentInfoKHR *pi)
 {
     static const VkPresentModeKHR fifo = VK_PRESENT_MODE_FIFO_KHR;
-    struct swapchain *sc = pi->swapchainCount == 1 ? find_sc(pi->pSwapchains[0], false) : NULL;
+    struct dev *d = find_dev(KEY(queue));
+    struct swapchain *sc = pi->swapchainCount == 1 ? find_sc(d, pi->pSwapchains[0], false) : NULL;
     // A swapchain created with a list of present modes (VK_EXT_swapchain_maintenance1, as DXVK
     // and vkd3d-proton do) takes a mode with each present, and keeps it for presents that name
     // none, the layer's own included. Outside FIFO they replace each other instead of queuing,
@@ -2318,7 +2320,7 @@ static VKAPI_ATTR VkResult VKAPI_CALL CreateSwapchainKHR(VkDevice device, const 
         sc->timing = timing;
         // a recreated swapchain (resize, mode change) keeps what auto pacing has learned, and
         // whether the game was below min_fps
-        struct swapchain *old = ci->oldSwapchain ? find_sc(ci->oldSwapchain, false) : NULL;
+        struct swapchain *old = ci->oldSwapchain ? find_sc(d, ci->oldSwapchain, false) : NULL;
         if (old && old->pace.n) {
             sc->pace = old->pace;
             sc->pace.waited_ns = 0;
@@ -2345,7 +2347,7 @@ static VKAPI_ATTR void VKAPI_CALL DestroySwapchainKHR(VkDevice device, VkSwapcha
                                                       const VkAllocationCallbacks *alloc)
 {
     struct dev *d = find_dev(KEY(device));
-    struct swapchain *sc = swapchain ? find_sc(swapchain, true) : NULL;
+    struct swapchain *sc = swapchain ? find_sc(d, swapchain, true) : NULL;
     if (sc)
         sc_destroy(sc);
     d->DestroySwapchainKHR(device, swapchain, alloc);
@@ -2356,7 +2358,7 @@ static VKAPI_ATTR VkResult VKAPI_CALL AcquireNextImageKHR(VkDevice device, VkSwa
                                                           VkSemaphore semaphore, VkFence fence, uint32_t *index)
 {
     struct dev *d = find_dev(KEY(device));
-    struct swapchain *sc = find_sc(swapchain, false);
+    struct swapchain *sc = find_sc(d, swapchain, false);
     double t = now_s();
     VkResult r = d->AcquireNextImageKHR(device, swapchain, timeout, semaphore, fence, index);
     if (sc)
