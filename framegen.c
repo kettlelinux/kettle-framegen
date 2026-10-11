@@ -796,10 +796,6 @@ static void ring_free(struct swapchain *sc)
         }
         *f = (struct frame){ 0 };
     }
-    for (uint32_t i = 0; i < sc->nimages; i++)
-        if (sc->present_sems[i])
-            d->DestroySemaphore(dev, sc->present_sems[i], NULL);
-    memset(sc->present_sems, 0, sc->nimages * sizeof(*sc->present_sems));
     if (sc->burst.buf || sc->burst.cmd[0])
         burst_free(sc);
     if (sc->rec)
@@ -851,6 +847,19 @@ static void sc_free(struct swapchain *sc)
     ring_free(sc);
 }
 
+// With the swapchain itself. The present semaphores outlive sc_free: queued presents may still
+// wait on them when the ring is rebuilt.
+static void sc_destroy(struct swapchain *sc)
+{
+    sc_free(sc);
+    for (uint32_t i = 0; i < sc->nimages; i++)
+        if (sc->present_sems[i])
+            sc->dev->DestroySemaphore(sc->dev->handle, sc->present_sems[i], NULL);
+    free(sc->images);
+    free(sc->present_sems);
+    free(sc);
+}
+
 static bool ring_build(struct swapchain *sc, uint32_t family)
 {
     struct dev *d = sc->dev;
@@ -882,8 +891,8 @@ static bool ring_build(struct swapchain *sc, uint32_t family)
             if (d->CreateSemaphore(dev, &semi, NULL, &f->acquired[k]) != VK_SUCCESS)
                 return false;
     }
-    for (uint32_t i = 0; i < sc->nimages; i++)
-        if (d->CreateSemaphore(dev, &semi, NULL, &sc->present_sems[i]) != VK_SUCCESS)
+    for (uint32_t i = 0; i < sc->nimages; i++)  // kept from an earlier ring
+        if (!sc->present_sems[i] && d->CreateSemaphore(dev, &semi, NULL, &sc->present_sems[i]) != VK_SUCCESS)
             return false;
     if (d->families[family].timestampValidBits) {
         VkQueryPoolCreateInfo qci = {
@@ -2328,12 +2337,8 @@ static VKAPI_ATTR void VKAPI_CALL DestroySwapchainKHR(VkDevice device, VkSwapcha
 {
     struct dev *d = find_dev(KEY(device));
     struct swapchain *sc = swapchain ? find_sc(swapchain, true) : NULL;
-    if (sc) {
-        sc_free(sc);
-        free(sc->images);
-        free(sc->present_sems);
-        free(sc);
-    }
+    if (sc)
+        sc_destroy(sc);
     d->DestroySwapchainKHR(device, swapchain, alloc);
 }
 
@@ -2675,10 +2680,7 @@ static VKAPI_ATTR void VKAPI_CALL DestroyDevice(VkDevice device, const VkAllocat
     pthread_mutex_unlock(&lock);
     while ((s = mine)) {
         mine = s->next;
-        sc_free(s);
-        free(s->images);
-        free(s->present_sems);
-        free(s);
+        sc_destroy(s);
     }
     dev_free_pipelines(d);
     d->DestroyDevice(device, alloc);
