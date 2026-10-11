@@ -1,23 +1,38 @@
 name: build
 on: [push, pull_request]
+permissions:
+  contents: read
 jobs:
   build:
     strategy:
       matrix:
         os: [ubuntu-24.04-arm, ubuntu-24.04]
     runs-on: ${{ matrix.os }}
+    env:
+      # Ubuntu's headers predate VK_EXT_present_timing, which would leave its code unbuilt
+      CPPFLAGS: -I${{ github.workspace }}/../Vulkan-Headers/include
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4.4.0
       - run: sudo apt-get update && sudo apt-get install -y glslang-tools libvulkan-dev mesa-vulkan-drivers
+      - run: git clone --depth 1 --branch v1.4.363 https://github.com/KhronosGroup/Vulkan-Headers ../Vulkan-Headers
       - run: make
+      - run: grep -qa vkGetSwapchainTimingPropertiesEXT build/libVkLayer_kettle_framegen.so
       # the shaders on lavapipe (no GPU on the runners) against test/cases' references
       - run: make test FGTEST_FLAGS="-o $PWD/fgtest-out"
       - if: failure()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4.6.2
         with:
           name: fgtest-out-${{ matrix.os }}
           path: fgtest-out
+      # the same under AddressSanitizer and UBSan; leaks only for pacetest (the driver has its own)
+      - run: |
+          mkdir -p build/san
+          make CFLAGS="-O1 -g -fsanitize=address,undefined -fno-sanitize-recover=all -fno-omit-frame-pointer" \
+            PACETEST=build/san/pacetest FGTEST=build/san/fgtest build/san/pacetest build/san/fgtest
+          build/san/pacetest
+          ASAN_OPTIONS=detect_leaks=0 build/san/fgtest test/cases/*
       - run: make install DESTDIR="$PWD/stage" && find stage -type f
+      - run: grep -q '"/usr/lib/libVkLayer_kettle_framegen.so"' stage/usr/share/vulkan/implicit_layer.d/VkLayer_kettle_framegen.json
       # 32-bit x86 copy for 32-bit games, x86_64 only
       - if: matrix.os == 'ubuntu-24.04'
         run: sudo apt-get install -y gcc-multilib
@@ -28,3 +43,6 @@ jobs:
           make install-lib32 DESTDIR="$PWD/stage" && find stage -type f
           grep -q '"VK_LAYER_KETTLE_framegen_32"' stage/usr/share/vulkan/implicit_layer.d/VkLayer_kettle_framegen_32.json
           grep -q '/usr/lib32/' stage/usr/share/vulkan/implicit_layer.d/VkLayer_kettle_framegen_32.json
+          # the pacing maths in 32 bits
+          make CFLAGS="-O2 -m32" PACETEST=build/32/pacetest build/32/pacetest
+          build/32/pacetest
