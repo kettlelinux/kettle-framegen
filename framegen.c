@@ -2171,6 +2171,13 @@ static VKAPI_ATTR VkResult VKAPI_CALL QueuePresentKHR(VkQueue queue, const VkPre
     static const VkPresentModeKHR fifo = VK_PRESENT_MODE_FIFO_KHR;
     struct dev *d = find_dev(KEY(queue));
     struct swapchain *sc = pi->swapchainCount == 1 ? find_sc(d, pi->pSwapchains[0], false) : NULL;
+    // A present naming several swapchains (rare) goes out as it is, without its frames in the
+    // history: the next frame of each starts it again rather than following one from before
+    for (uint32_t k = 0; pi->swapchainCount > 1 && k < pi->swapchainCount; k++) {
+        struct swapchain *other = find_sc(d, pi->pSwapchains[k], false);
+        if (other)
+            other->have_prev = other->have_mv = false;
+    }
     // A swapchain created with a list of present modes (VK_EXT_swapchain_maintenance1, as DXVK
     // and vkd3d-proton do) takes a mode with each present, and keeps it for presents that name
     // none, the layer's own included. Outside FIFO they replace each other instead of queuing,
