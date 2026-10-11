@@ -287,6 +287,7 @@ struct inst {
     PFN_vkGetPhysicalDeviceMemoryProperties GetPhysicalDeviceMemoryProperties;
     PFN_vkGetPhysicalDeviceProperties GetPhysicalDeviceProperties;
     PFN_vkGetPhysicalDeviceSurfaceCapabilitiesKHR GetPhysicalDeviceSurfaceCapabilitiesKHR;
+    PFN_vkGetPhysicalDeviceSurfaceCapabilities2KHR GetPhysicalDeviceSurfaceCapabilities2KHR;  // where surface_caps2
     PFN_vkEnumerateDeviceExtensionProperties EnumerateDeviceExtensionProperties;
     PFN_vkGetPhysicalDeviceFeatures2 GetPhysicalDeviceFeatures2;
     bool surface_caps2;  // VK_KHR_get_surface_capabilities2 is on (VK_EXT_present_timing needs it)
@@ -2195,6 +2196,21 @@ static VkFormat hist_format(VkFormat f, bool *bgr)
     }
 }
 
+#ifdef VK_EXT_present_timing
+// The device having VK_EXT_present_timing doesn't mean every surface does (X11, say)
+static bool surface_timing(struct dev *d, VkSurfaceKHR surface)
+{
+    if (!d->inst->GetPhysicalDeviceSurfaceCapabilities2KHR)
+        return false;
+    VkPresentTimingSurfaceCapabilitiesEXT pt = { .sType = VK_STRUCTURE_TYPE_PRESENT_TIMING_SURFACE_CAPABILITIES_EXT };
+    VkSurfaceCapabilities2KHR caps = { .sType = VK_STRUCTURE_TYPE_SURFACE_CAPABILITIES_2_KHR, .pNext = &pt };
+    VkPhysicalDeviceSurfaceInfo2KHR si = { .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SURFACE_INFO_2_KHR,
+                                           .surface = surface };
+    return d->inst->GetPhysicalDeviceSurfaceCapabilities2KHR(d->phys, &si, &caps) == VK_SUCCESS &&
+           pt.presentTimingSupported;
+}
+#endif
+
 static VKAPI_ATTR VkResult VKAPI_CALL CreateSwapchainKHR(VkDevice device, const VkSwapchainCreateInfoKHR *ci,
                                                          const VkAllocationCallbacks *alloc, VkSwapchainKHR *out)
 {
@@ -2245,14 +2261,16 @@ static VKAPI_ATTR VkResult VKAPI_CALL CreateSwapchainKHR(VkDevice device, const 
     }
     bool timing = false;
 #ifdef VK_EXT_present_timing
-    if (d->GetSwapchainTimingPropertiesEXT) {
+    if (d->GetSwapchainTimingPropertiesEXT && surface_timing(d, ci->surface)) {
         ci2.flags |= VK_SWAPCHAIN_CREATE_PRESENT_TIMING_BIT_EXT;  // for the refresh rate
         timing = true;
     }
 #endif
     VkResult r = d->CreateSwapchainKHR(device, &ci2, alloc, out);
 #ifdef VK_EXT_present_timing
-    if (r != VK_SUCCESS && timing) {  // as the game asked, then
+    // as the game asked, then; not after a failure has retired the old swapchain, which the
+    // retry couldn't name again
+    if (r != VK_SUCCESS && timing && !ci2.oldSwapchain) {
         ci2.flags &= ~VK_SWAPCHAIN_CREATE_PRESENT_TIMING_BIT_EXT;
         timing = false;
         r = d->CreateSwapchainKHR(device, &ci2, alloc, out);
@@ -2390,6 +2408,8 @@ static VKAPI_ATTR VkResult VKAPI_CALL CreateInstance(const VkInstanceCreateInfo 
     LOAD(GetPhysicalDeviceSurfaceCapabilitiesKHR);
     LOAD(EnumerateDeviceExtensionProperties);
     LOAD(GetPhysicalDeviceFeatures2);
+    if (caps2)
+        LOAD(GetPhysicalDeviceSurfaceCapabilities2KHR);
     if (!i->GetPhysicalDeviceFeatures2)
         i->GetPhysicalDeviceFeatures2 = (PFN_vkGetPhysicalDeviceFeatures2)gipa(*out, "vkGetPhysicalDeviceFeatures2KHR");
 #undef LOAD
