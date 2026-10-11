@@ -231,9 +231,12 @@ frame ahead of the display. Any further and its frames wait in the swapchain's q
 input latency. With `latency = low`, after each of the game's frames the layer waits until the
 previous one is on screen, so the game starts its next frame that much later and closer to
 being shown. It needs `VK_KHR_present_wait` (RADV, Turnip and PanVK have it; the layer turns it
-on). Many games already keep their own queue short (vkd3d-proton and DXVK do), and at a full
+on), or the game's own `VK_KHR_present_wait2` (DXVK 2.7 uses it where the driver has it, as Turnip
+does). Many games already keep their own queue short (vkd3d-proton and DXVK do), and at a full
 display the layer's own wait for spare images does too, so `stats` logs how often the previous
-frame wasn't shown yet: near 0%, `low` changes nothing.
+frame wasn't shown yet: near 0%, `low` changes nothing. Where the display holds the game (2x at
+half the refresh rate), `low` can cost a refresh now and then, which stutters: Deep Rock Galactic
+(DXVK) at 30 fps on 60 Hz showed 0% with `normal`, and stuttered with `low`.
 
 The layer logs to stderr with the prefix `VK_LAYER_KETTLE_framegen:`.
 

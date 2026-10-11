@@ -354,6 +354,10 @@ struct dev {
     // VK_KHR_present_wait (and the present_id it needs), for "latency = low" and its stats
     PFN_vkWaitForPresentKHR WaitForPresentKHR;
     bool game_ids;  // the game enabled present ids itself: its own then, never mixed with the layer's
+#ifdef VK_KHR_present_wait2
+    // the game's VK_KHR_present_wait2: its ids then come in VkPresentId2KHR (DXVK 2.7 on Turnip)
+    PFN_vkWaitForPresent2KHR WaitForPresent2KHR;
+#endif
 #ifdef VK_EXT_present_timing
     PFN_vkGetSwapchainTimingPropertiesEXT GetSwapchainTimingPropertiesEXT;  // the refresh rate
 #endif
@@ -489,9 +493,11 @@ struct swapchain {
     // Latency (present_wait): the id of the game's last presented frame and of the one before,
     // and per stats period: presents, how many found the one before not yet shown, time waited
     uint64_t present_id, prev_id;
+    bool prev_id2;          // prev_id came in VkPresentId2KHR
     uint32_t lat_n, lat_behind;
     double lat_wait;
     bool timing;            // created for VK_EXT_present_timing: the display tells its refresh rate
+    bool wait2;             // the game created it for VK_KHR_present_wait2 (see present_game())
     float timing_hz;        // ...which it last told, 0 until it does
     double timing_at;       // when to ask again
 };
@@ -1884,6 +1890,20 @@ static VkResult present(struct swapchain *sc, VkQueue queue, const VkPresentInfo
     return r;
 }
 
+// Waits up to `timeout` ns for the present with this id to reach the screen; VK_TIMEOUT if it hasn't
+static VkResult wait_shown(struct swapchain *sc, uint64_t id, bool id2, uint64_t timeout)
+{
+    struct dev *d = sc->dev;
+#ifdef VK_KHR_present_wait2
+    if (id2) {
+        VkPresentWait2InfoKHR w = { .sType = VK_STRUCTURE_TYPE_PRESENT_WAIT_2_INFO_KHR, .presentId = id, .timeout = timeout };
+        return d->WaitForPresent2KHR(d->handle, sc->handle, &w);
+    }
+#endif
+    (void)id2;
+    return d->WaitForPresentKHR(d->handle, sc->handle, id, timeout);
+}
+
 // The game's own frame. It goes out tagged with a present id (the game's, or the layer's when
 // the game gives none) so the layer can see it reach the screen. Generated frames between two
 // real ones need the later one rendered, so the game has to be a frame ahead of the display:
@@ -1891,18 +1911,31 @@ static VkResult present(struct swapchain *sc, VkQueue queue, const VkPresentInfo
 // further ahead and its frames wait in the queue, as latency; "latency = low" waits for it
 // here, which starts the game's next frame that much later and so that much closer to being
 // shown. Otherwise the layer only looks, for the stats.
+// A game with VK_KHR_present_wait2 (DXVK 2.7 where the driver has it, as Turnip does) gives its
+// ids in VkPresentId2KHR, and they are waited for with vkWaitForPresent2KHR, on a swapchain
+// created for it.
 static VkResult present_game(struct swapchain *sc, VkQueue queue, const VkPresentInfoKHR *pi, bool low)
 {
     struct dev *d = sc->dev;
-    if (!d->WaitForPresentKHR)
+    if (!d->WaitForPresentKHR && !sc->wait2)
         return present(sc, queue, pi);
     const VkPresentIdKHR *gid = find_struct(pi->pNext, VK_STRUCTURE_TYPE_PRESENT_ID_KHR);
     uint64_t id = gid && gid->swapchainCount && gid->pPresentIds ? gid->pPresentIds[0] : 0;
+    bool id2 = false;
+#ifdef VK_KHR_present_wait2
+    const VkPresentId2KHR *gid2 = sc->wait2 && !id ? find_struct(pi->pNext, VK_STRUCTURE_TYPE_PRESENT_ID_2_KHR) : NULL;
+    if (gid2 && gid2->swapchainCount && gid2->pPresentIds && gid2->pPresentIds[0]) {
+        id = gid2->pPresentIds[0];
+        id2 = true;
+    }
+#endif
+    if (!id2 && !d->WaitForPresentKHR)
+        id = 0;  // only the game's present_id2 ids can be followed here
     VkPresentInfoKHR tagged = *pi;
     VkPresentIdKHR mine;
     if (id > sc->present_id) {
         sc->present_id = id;
-    } else if (!gid && !d->game_ids) {  // ids must rise: one of the layer's could match the game's next
+    } else if (!gid && !d->game_ids && d->WaitForPresentKHR) {  // ids must rise: one of the layer's could match the game's next
         id = ++sc->present_id;
         mine = (VkPresentIdKHR){ VK_STRUCTURE_TYPE_PRESENT_ID_KHR, pi->pNext, 1, &id };
         tagged.pNext = &mine;
@@ -1912,18 +1945,20 @@ static VkResult present_game(struct swapchain *sc, VkQueue queue, const VkPresen
     VkResult r = present(sc, queue, &tagged);
     if (id && sc->prev_id) {
         sc->lat_n++;
-        if (d->WaitForPresentKHR(d->handle, sc->handle, sc->prev_id, 0) == VK_TIMEOUT) {
+        if (wait_shown(sc, sc->prev_id, sc->prev_id2, 0) == VK_TIMEOUT) {
             sc->lat_behind++;
             if (low) {
                 double t = now_s();
-                d->WaitForPresentKHR(d->handle, sc->handle, sc->prev_id, LATENCY_TIMEOUT);
+                wait_shown(sc, sc->prev_id, sc->prev_id2, LATENCY_TIMEOUT);
                 sc->lat_wait += now_s() - t;
                 waited(sc, t);
             }
         }
     }
-    if (id && r >= 0)  // a present that failed queued no id to wait for
+    if (id && r >= 0) {  // a present that failed queued no id to wait for
         sc->prev_id = id;
+        sc->prev_id2 = id2;
+    }
     return r;
 }
 
@@ -2490,6 +2525,9 @@ static VKAPI_ATTR VkResult VKAPI_CALL CreateSwapchainKHR(VkDevice device, const 
         sc->bgr = bgr;
         sc->fifo = c.fifo;
         sc->timing = timing;
+#ifdef VK_KHR_present_wait2
+        sc->wait2 = (ci->flags & VK_SWAPCHAIN_CREATE_PRESENT_WAIT_2_BIT_KHR) && d->WaitForPresent2KHR;
+#endif
         // a recreated swapchain (resize, mode change) keeps what auto pacing has learned, and
         // whether the game was below min_fps
         struct swapchain *old = ci->oldSwapchain ? find_sc(d, ci->oldSwapchain, false) : NULL;
@@ -2840,6 +2878,10 @@ static VKAPI_ATTR VkResult VKAPI_CALL CreateDevice(VkPhysicalDevice phys, const 
 #undef X
     if (present_wait)
         d->WaitForPresentKHR = (PFN_vkWaitForPresentKHR)gdpa(*out, "vkWaitForPresentKHR");
+#ifdef VK_KHR_present_wait2
+    if (names_ext(ci->ppEnabledExtensionNames, ci->enabledExtensionCount, VK_KHR_PRESENT_WAIT_2_EXTENSION_NAME))
+        d->WaitForPresent2KHR = (PFN_vkWaitForPresent2KHR)gdpa(*out, "vkWaitForPresent2KHR");
+#endif
 #ifdef VK_EXT_present_timing
     if (timing)
         d->GetSwapchainTimingPropertiesEXT =
@@ -2849,7 +2891,12 @@ static VKAPI_ATTR VkResult VKAPI_CALL CreateDevice(VkPhysicalDevice phys, const 
     d->next = devs;
     devs = d;
     pthread_mutex_unlock(&lock);
-    say("on %s%s%s", props.deviceName, d->WaitForPresentKHR ? "" : ", no present wait (latency = low off)",
+    bool wait2 = false;
+#ifdef VK_KHR_present_wait2
+    wait2 = d->WaitForPresent2KHR;
+#endif
+    say("on %s%s%s%s", props.deviceName, d->WaitForPresentKHR || wait2 ? "" : ", no present wait (latency = low off)",
+        wait2 ? ", the game's present wait 2" : "",
 #ifdef VK_EXT_present_timing
         d->GetSwapchainTimingPropertiesEXT ? ", present timing (refresh rate from the display)" :
 #endif
