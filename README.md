@@ -168,8 +168,12 @@ without a restart, except the two marked below. The file is the first of:
 - `$XDG_CONFIG_HOME/kettle-framegen/<SteamAppId>.conf`
 - `~/.config/kettle-framegen/<SteamAppId>.conf`
 
-Without a `SteamAppId`, `default` is used as the name. A `KETTLE_FG_<KEY>` variable (for
-example `KETTLE_FG_MULTIPLIER=3`) overrides the file.
+Without a `SteamAppId`, `default` is used as the name. For the keys from `multiplier` to
+`latency`, a `KETTLE_FG_<KEY>` variable (for example `KETTLE_FG_MULTIPLIER=3`) overrides the
+file. The debugging keys after them are only read from the file, since a request there is served
+when the file changes. `KETTLE_FG_DUMP=<dir>` is separate: it saves one present's frames, the two
+real ones and those generated between, to `<dir>` at the 300th present (or at
+`KETTLE_FG_DUMP_FRAME`).
 
 | Key | Default | Meaning |
 | --- | --- | --- |
