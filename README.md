@@ -55,7 +55,7 @@ This installs the library in `$LIB32DIR` and a second manifest,
 `VkLayer_kettle_framegen_32.json`, for a layer named `VK_LAYER_KETTLE_framegen_32`. The Vulkan
 loader picks layers by name, so the two copies need different names. Each game then loads
 the copy that matches its own architecture. `make install-lib32` takes the same `PREFIX`,
-`DESTDIR`, `CC` and `CFLAGS` as `make install`, and `CFLAGS32` (default `-m32`) holds the
+`DESTDIR`, `CC`, `CPPFLAGS` and `CFLAGS` as `make install`, and `CFLAGS32` (default `-m32`) holds the
 32-bit flags.
 
 ## Testing
