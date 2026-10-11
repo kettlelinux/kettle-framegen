@@ -23,6 +23,7 @@
 #include <string.h>
 #include <strings.h>
 #include <ctype.h>
+#include <dlfcn.h>
 #include <time.h>
 #include <pthread.h>
 #include <sys/stat.h>
@@ -1967,12 +1968,150 @@ static bool below_min_fps(struct swapchain *sc, double t, float min_fps, float r
     return m->off;
 }
 
+// ---------- gamescope's frame limit ----------
+
+// Steam's frame limit in its game mode (gamescope) caps every present below the layer, the
+// generated frames too, so for auto and min_fps it is the display's rate where it is lower.
+// Steam sets it as GAMESCOPE_FPS_LIMIT on the root window of its own Xwayland (:0; games often
+// run on another), 0 or absent for none. Read through libxcb, loaded when first needed, so the
+// layer needs no X11 to build or run. The protocol structs used are fixed by X11 itself.
+typedef struct xcb_connection_t xcb_connection_t;
+typedef struct { unsigned int sequence; } xcb_cookie_t;
+typedef struct { uint32_t root; } xcb_screen_t;  // only its first field read
+typedef struct { xcb_screen_t *data; int rem, index; } xcb_screen_iterator_t;
+typedef struct { uint8_t response_type, pad0; uint16_t sequence; uint32_t length, atom; } xcb_intern_atom_reply_t;
+typedef struct {
+    uint8_t response_type, format;
+    uint16_t sequence;
+    uint32_t length, type, bytes_after, value_len;
+    uint8_t pad0[12];
+} xcb_get_property_reply_t;
+
+static struct {
+    bool tried;
+    void *lib;
+    xcb_connection_t *(*connect)(const char *, int *);
+    int (*has_error)(xcb_connection_t *);
+    void (*disconnect)(xcb_connection_t *);
+    const void *(*get_setup)(xcb_connection_t *);
+    xcb_screen_iterator_t (*roots)(const void *);
+    xcb_cookie_t (*intern_atom)(xcb_connection_t *, uint8_t, uint16_t, const char *);
+    xcb_intern_atom_reply_t *(*intern_atom_reply)(xcb_connection_t *, xcb_cookie_t, void **);
+    xcb_cookie_t (*get_property)(xcb_connection_t *, uint8_t, uint32_t, uint32_t, uint32_t, uint32_t, uint32_t);
+    xcb_get_property_reply_t *(*get_property_reply)(xcb_connection_t *, xcb_cookie_t, void **);
+    void *(*property_value)(const xcb_get_property_reply_t *);
+    int (*property_length)(const xcb_get_property_reply_t *);
+    struct xdisp { char name[64]; xcb_connection_t *c; uint32_t root, atom; } disp[2];
+    int ndisp;
+} xcb;
+
+static bool xcb_load(void)
+{
+    if (xcb.tried)
+        return xcb.lib != NULL;
+    xcb.tried = true;
+    if (!getenv("GAMESCOPE_WAYLAND_DISPLAY") || !(xcb.lib = dlopen("libxcb.so.1", RTLD_NOW | RTLD_LOCAL)))
+        return false;
+#define SYM(f, n) (*(void **)&xcb.f = dlsym(xcb.lib, n))
+    if (!SYM(connect, "xcb_connect") || !SYM(has_error, "xcb_connection_has_error") ||
+        !SYM(disconnect, "xcb_disconnect") || !SYM(get_setup, "xcb_get_setup") ||
+        !SYM(roots, "xcb_setup_roots_iterator") || !SYM(intern_atom, "xcb_intern_atom") ||
+        !SYM(intern_atom_reply, "xcb_intern_atom_reply") || !SYM(get_property, "xcb_get_property") ||
+        !SYM(get_property_reply, "xcb_get_property_reply") || !SYM(property_value, "xcb_get_property_value") ||
+        !SYM(property_length, "xcb_get_property_value_length")) {
+        dlclose(xcb.lib);
+        xcb.lib = NULL;
+        return false;
+    }
+#undef SYM
+    const char *own = getenv("DISPLAY");
+    if (own && *own)
+        snprintf(xcb.disp[xcb.ndisp++].name, sizeof(xcb.disp[0].name), "%s", own);
+    if (!own || strcmp(own, ":0"))
+        snprintf(xcb.disp[xcb.ndisp++].name, sizeof(xcb.disp[0].name), ":0");
+    return true;
+}
+
+// The limit on one display: > 0 set, 0 none, -1 not known there (no connection, no such atom yet)
+static float xcb_limit(int k)
+{
+    struct xdisp *x = &xcb.disp[k];
+    if (x->c && xcb.has_error(x->c)) {
+        xcb.disconnect(x->c);
+        x->c = NULL;
+    }
+    if (!x->c) {
+        x->c = xcb.connect(x->name, NULL);
+        if (xcb.has_error(x->c)) {
+            xcb.disconnect(x->c);
+            x->c = NULL;
+            return -1;
+        }
+        x->root = xcb.roots(xcb.get_setup(x->c)).data->root;
+        x->atom = 0;
+    }
+    if (!x->atom) {  // only once it exists: Steam creates it with the first limit
+        static const char name[] = "GAMESCOPE_FPS_LIMIT";
+        xcb_intern_atom_reply_t *a = xcb.intern_atom_reply(x->c, xcb.intern_atom(x->c, 1, sizeof(name) - 1, name), NULL);
+        x->atom = a ? a->atom : 0;
+        free(a);
+        if (!x->atom)
+            return -1;
+    }
+    xcb_get_property_reply_t *r = xcb.get_property_reply(x->c, xcb.get_property(x->c, 0, x->root, x->atom, 6, 0, 1), NULL);
+    float limit = r && r->format == 32 && xcb.property_length(r) >= 4 ? (float)*(uint32_t *)xcb.property_value(r) : -1;
+    free(r);
+    return limit;
+}
+
+static float gamescope_limit(void)
+{
+    if (!xcb_load())
+        return 0;
+    for (int k = 0; k < xcb.ndisp; k++) {
+        float limit = xcb_limit(k);
+        if (limit >= 0)
+            return limit;
+    }
+    return 0;
+}
+
+// Replaced in test/pacetest.c
+static float (*frame_limit_source)(void) = gamescope_limit;
+
+// Asked at most once a second (the limit changes as the player picks another)
+static float frame_limit(double t)
+{
+    static pthread_mutex_t m = PTHREAD_MUTEX_INITIALIZER;
+    static double at = -1.0;
+    static float limit;
+    pthread_mutex_lock(&m);
+    if (t >= at || t < at - 1.0) {  // the second: a simulated clock may start over
+        at = t + 1.0;
+        float l = frame_limit_source();
+        if (l != limit) {
+            if (l > 0)
+                say("frame limit %.0f fps (gamescope): auto fills that, not the display's refresh rate", l);
+            else
+                say("no frame limit (gamescope) any more");
+        }
+        limit = l;
+    }
+    float l = limit;
+    pthread_mutex_unlock(&m);
+    return l;
+}
+
 // Frames shown per rendered one for this present
 static int multiplier_now(struct swapchain *sc, double t, const struct config *c)
 {
     float hz = 0;
-    if (!c->multiplier || c->min_fps > 0)
+    if (!c->multiplier || c->min_fps > 0) {
         hz = c->refresh > 0 ? c->refresh : display_refresh(sc, t);
+        float limit = frame_limit(t);
+        if (limit > 0 && (hz <= 0 || limit < hz))
+            hz = limit;
+    }
     if (below_min_fps(sc, t, c->min_fps, hz))
         return 1;
     if (c->multiplier)

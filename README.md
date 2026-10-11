@@ -208,7 +208,14 @@ Snapdragon 8 Gen 3), the display tells `auto` its refresh rate and the log shows
 (Adreno 740 and older, PanVK) set `refresh`: without it, the layer takes the display as full
 when the game waits for it and measures the refresh rate there, but a GPU-bound game also waits
 short of full, so `auto` can settle too low; with a frame limiter between the layer and the
-display, it measures the limit. A `refresh` setting always wins.
+display, it measures the limit. A `refresh` setting wins over both.
+
+In Steam's game mode (gamescope, as on the Steam Deck and Kettle Linux), Steam's frame limit caps
+every frame shown, the generated ones too. Where one is set below the refresh rate, `auto` and
+`min_fps` go by it instead, so a 60 fps limit on a 120 Hz display gets 2x at 30 rendered fps
+rather than tries at 3x that the limit cuts short. The layer reads it once a second (as
+`GAMESCOPE_FPS_LIMIT` on gamescope's Xwayland, through libxcb), so changing it while playing
+applies at once, and the log shows each change.
 
 With `min_fps` set, a game rendering below it gets no generated frames: each real frame waits
 for the next before the frames between can be made, so a slow game waits long, and its motion

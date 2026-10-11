@@ -11,6 +11,14 @@
 // simulated clock. -v shows the layer's log.
 #include "../framegen.c"
 
+// gamescope's frame limit (Steam's), which caps every frame shown; 0 for none
+static double gs_limit;
+
+static float sim_limit(void)
+{
+    return (float)gs_limit;
+}
+
 struct sim {
     double hz;        // the display's refresh rate
     struct config cfg;  // multiplier (0: auto), refresh (0: measure it), min_fps
@@ -30,6 +38,7 @@ static void sim_init(struct sim *s, double hz, float refresh, double fps)
     s->cfg.refresh = refresh;
     s->fps = fps;
     s->t = 100.0;
+    gs_limit = 0;
 }
 
 // Runs until `until` seconds into the simulation; returns the multiplier then
@@ -44,7 +53,8 @@ static int sim_run(struct sim *s, double until)
         }
         s->n = n;
         int shown = s->max_shown && n > s->max_shown ? s->max_shown : n;
-        double game = 1.0 / s->fps, shown_t = shown / s->hz;
+        double hz = gs_limit > 0 && gs_limit < s->hz ? gs_limit : s->hz;
+        double game = 1.0 / s->fps, shown_t = shown / hz;
         double dt = game > shown_t ? game : shown_t;
         s->sc.pace.waited_ns += (uint64_t)((dt - game) * 1e9);
         s->sc.pace.win_shown += shown;
@@ -78,6 +88,7 @@ int main(int argc, char **argv)
 {
     if (!(argc > 1 && !strcmp(argv[1], "-v")) && !freopen("/dev/null", "w", stderr))
         return 1;
+    frame_limit_source = sim_limit;
     struct sim s;
 
     // 70 fps on 180 Hz needs 3x; 2x is tried now and then, ever less often
@@ -176,6 +187,34 @@ int main(int argc, char **argv)
     s.cfg.min_fps = 30;
     n = sim_run(&s, 60);
     check("100 fps at 60 Hz, 3x (held at 20 fps), min_fps 30: 3x", n == 3 && s.changes == 0, &s);
+
+    // Steam's frame limit at 60 on a 120 Hz display (refresh = 120 set): 30 fps fills it at 2x,
+    // and 3x, which only the display could show, isn't tried (1x is, as the game is held)
+    sim_init(&s, 120, 120, 30);
+    gs_limit = 60;
+    n = sim_run(&s, 600);
+    check("30 fps, 120 Hz limited to 60: 2x, never 3x", n == 2 && share(&s, 3) == 0 && share(&s, 2) > 0.95 && s.downs <= 7, &s);
+
+    // 20 fps fills the limit at 3x
+    sim_init(&s, 120, 120, 20);
+    gs_limit = 60;
+    n = sim_run(&s, 120);
+    check("20 fps, 120 Hz limited to 60: 3x", n == 3 && share(&s, 3) > 0.9, &s);
+
+    // the refresh rate measured: the limit is what the game waits for anyway
+    sim_init(&s, 120, 0, 30);
+    gs_limit = 60;
+    n = sim_run(&s, 600);
+    check("30 fps, 120 Hz limited to 60, measured: 2x", n == 2 && share(&s, 3) < 0.02, &s);
+
+    // the limit lifted while playing: auto goes by the display again
+    sim_init(&s, 120, 120, 40);
+    gs_limit = 60;
+    n = sim_run(&s, 60);
+    bool was2l = n == 2;
+    gs_limit = 0;
+    n = sim_run(&s, 120);
+    check("40 fps, 120 Hz limited to 60, then not: 2x, 3x", was2l && n == 3, &s);
 
     printf("%d of %d pacing tests passed\n", run_n - failed, run_n);
     return failed != 0;
