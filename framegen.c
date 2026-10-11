@@ -475,13 +475,15 @@ struct swapchain {
     uint32_t levels;
     VkExtent2D luma[MAX_LEVELS], mv[MAX_LEVELS];
     struct img hist[2], pyr[2], mvl[MAX_LEVELS], mvf[2], out[MAX_GEN], still;  // still: synth.comp's HUD mask
+    struct img slide[2];  // slide.comp: HUD content sliding sideways, per history slot
     VkImageView pyr_level[2][MAX_LEVELS];
     VkDescriptorPool dpool;
-    VkDescriptorSet ds_luma[2], ds_down[2][MAX_LEVELS], ds_motion[2][MAX_LEVELS], ds_filter[2], ds_still[2];
+    VkDescriptorSet ds_luma[2], ds_down[2][MAX_LEVELS], ds_motion[2][MAX_LEVELS], ds_filter[2], ds_still[2], ds_slide[2];
     VkDescriptorSet ds_synth[2][MAX_GEN];
     int cur;             // history slot the next presented frame goes to
     bool have_prev;      // the other slot holds the previous frame and its pyramid
     bool still_kept;     // still holds a mask from before (still.comp keeps a history in it)
+    bool slide_kept[2];  // slide[s] was written (slide.comp reads the other slot's as its history)
     bool have_mv;        // mvf of the other slot holds the previous frame's vectors
     bool fresh;          // images still in UNDEFINED layout
     double gpu_ms[NTS], stat_t;  // per stage (gpu_ms[0]: total), summed over gpu_n presents
@@ -768,9 +770,9 @@ static VkDescriptorSet ds_make(struct swapchain *sc, int pipe, const VkImageView
     };
     if (d->AllocateDescriptorSets(d->handle, &ai, &set) != VK_SUCCESS)
         return VK_NULL_HANDLE;
-    VkDescriptorImageInfo ii[6];
+    VkDescriptorImageInfo ii[MAX_BINDINGS];
     VkDescriptorBufferInfo bi = { sc->cut, 0, VK_WHOLE_SIZE };
-    VkWriteDescriptorSet w[6];
+    VkWriteDescriptorSet w[MAX_BINDINGS];
     for (uint32_t i = 0; i < p->n; i++) {
         bool buf = p->types[i] == VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
         if (!buf)
@@ -849,6 +851,8 @@ static void flow_free(struct swapchain *sc)
     }
     for (int l = 0; l < MAX_LEVELS; l++)
         img_free(d, &sc->mvl[l]);
+    img_free(d, &sc->slide[0]);
+    img_free(d, &sc->slide[1]);
     for (int k = 0; k < MAX_GEN; k++)
         img_free(d, &sc->out[k]);
     img_free(d, &sc->still);
@@ -958,6 +962,9 @@ static bool flow_build(struct swapchain *sc, float flow_scale)
     for (uint32_t l = 0; l < sc->levels; l++)
         if (!img_create(d, &sc->mvl[l], vec, sc->mv[l], 1, rw))
             return false;
+    for (int s = 0; s < 2; s++)
+        if (!img_create(d, &sc->slide[s], vec, sc->mv[0], 1, rw))
+            return false;
     for (int k = 0; k < MAX_GEN; k++)
         if (!img_create(d, &sc->out[k], VK_FORMAT_R32_UINT, full, 1, VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT))
             return false;
@@ -970,13 +977,13 @@ static bool flow_build(struct swapchain *sc, float flow_scale)
         return false;
 
     VkDescriptorPoolSize sizes[] = {
-        { VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 2 * (1 + MAX_LEVELS + 4 * MAX_LEVELS + 1 + 2 + 4 * MAX_GEN) },
-        { VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 2 * (1 + MAX_LEVELS + MAX_LEVELS + 1 + 1 + MAX_GEN) },
-        { VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 2 * (1 + MAX_GEN) },
+        { VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 2 * (1 + MAX_LEVELS + 4 * MAX_LEVELS + 1 + 2 + 4 + 5 * MAX_GEN) },
+        { VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 2 * (1 + MAX_LEVELS + MAX_LEVELS + 1 + 1 + 1 + MAX_GEN) },
+        { VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 2 * (1 + 1 + MAX_GEN) },
     };
     VkDescriptorPoolCreateInfo dci = {
         .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO,
-        .maxSets = 2 * (1 + MAX_LEVELS + MAX_LEVELS + 1 + 1 + MAX_GEN),
+        .maxSets = 2 * (1 + MAX_LEVELS + MAX_LEVELS + 1 + 1 + 1 + MAX_GEN),
         .poolSizeCount = 3,
         .pPoolSizes = sizes,
     };
@@ -996,9 +1003,12 @@ static bool flow_build(struct swapchain *sc, float flow_scale)
         }
         ok = ok && (sc->ds_filter[c] = ds_make(sc, P_FILTER, (VkImageView[]){ sc->mvl[0].view, sc->mvf[c].view }));
         ok = ok && (sc->ds_still[c] = ds_make(sc, P_STILL, (VkImageView[]){ sc->hist[p].view, sc->hist[c].view, sc->still.view }));
+        ok = ok && (sc->ds_slide[c] = ds_make(sc, P_SLIDE, (VkImageView[]){ sc->hist[p].view, sc->hist[c].view, sc->mvf[c].view, sc->slide[p].view, sc->slide[c].view,
+                            VK_NULL_HANDLE }));
         for (int k = 0; k < MAX_GEN; k++)
             ok = ok && (sc->ds_synth[c][k] = ds_make(sc, P_SYNTH, (VkImageView[]){
-                            sc->hist[p].view, sc->hist[c].view, sc->mvf[c].view, sc->out[k].view, VK_NULL_HANDLE, sc->still.view }));
+                            sc->hist[p].view, sc->hist[c].view, sc->mvf[c].view, sc->out[k].view, VK_NULL_HANDLE, sc->still.view,
+                            sc->slide[c].view }));
         if (!ok)
             return false;
     }
@@ -1006,6 +1016,7 @@ static bool flow_build(struct swapchain *sc, float flow_scale)
     sc->have_prev = sc->have_mv = false;
     sc->fresh = true;
     sc->still_kept = false;
+    sc->slide_kept[0] = sc->slide_kept[1] = false;
     say("%ux%u: motion at %ux%u, %u levels", full.width, full.height, l0.width, l0.height, sc->levels);
     return true;
 }
@@ -1086,7 +1097,7 @@ static void record(struct swapchain *sc, VkCommandBuffer cmd, int slot, uint32_t
     if (sc->fresh) {
         // all our images live in GENERAL
         struct img *all[] = { &sc->hist[0], &sc->hist[1], &sc->pyr[0], &sc->pyr[1], &sc->mvf[0], &sc->mvf[1],
-                              &sc->out[0], &sc->out[1], &sc->still };
+                              &sc->out[0], &sc->out[1], &sc->still, &sc->slide[0], &sc->slide[1] };
         _Static_assert(MAX_GEN == 2, "out[] list above");
         VkImageMemoryBarrier b[sizeof(all) / sizeof(*all) + MAX_LEVELS];
         uint32_t n = 0;
@@ -1151,6 +1162,10 @@ static void record(struct swapchain *sc, VkCommandBuffer cmd, int slot, uint32_t
             int32_t keep = sc->still_kept;
             run(d, cmd, P_STILL, sc->ds_still[c], &keep, sizeof(keep), full);
             sc->still_kept = true;
+            compute_to_compute(d, cmd);
+            struct slide_pc spc = slide_push(full, sc->luma, (uint32_t)sc->count, sc->slide_kept[c ^ 1]);
+            run(d, cmd, P_SLIDE, sc->ds_slide[c], &spc, sizeof(spc), sc->mv[0]);
+            sc->slide_kept[c] = true;
             compute_to_compute(d, cmd);
         }
         STAMP(TS_MOTION);

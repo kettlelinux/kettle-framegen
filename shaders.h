@@ -8,12 +8,14 @@
 #include "motion.spv.h"
 #include "filter.spv.h"
 #include "still.spv.h"
+#include "slide.spv.h"
 #include "synth.spv.h"
 
 #define MAX_LEVELS 7
 #define BLOCK 8  // motion block size, pixels (motion.comp B)
 
-enum { P_LUMA, P_DOWN, P_MOTION, P_FILTER, P_STILL, P_SYNTH, NPIPE };
+enum { P_LUMA, P_DOWN, P_MOTION, P_FILTER, P_STILL, P_SLIDE, P_SYNTH, NPIPE };
+#define MAX_BINDINGS 7
 #define PUSH_SIZE 32
 
 #define S VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER
@@ -23,7 +25,7 @@ static const struct pipe_spec {
     const uint32_t *code;
     size_t size;
     uint32_t n;
-    VkDescriptorType types[6];
+    VkDescriptorType types[MAX_BINDINGS];
     bool wide;  // workgroup size from specialization constants 0 and 1 (see pipe_group())
 } pipe_specs[NPIPE] = {
     [P_LUMA] = { spv_luma0, sizeof(spv_luma0), 2, { S, W }, true },
@@ -31,7 +33,8 @@ static const struct pipe_spec {
     [P_MOTION] = { spv_motion, sizeof(spv_motion), 5, { S, S, S, S, W }, false },
     [P_FILTER] = { spv_filter, sizeof(spv_filter), 3, { S, W, B }, false },
     [P_STILL] = { spv_still, sizeof(spv_still), 3, { S, S, W }, true },
-    [P_SYNTH] = { spv_synth, sizeof(spv_synth), 6, { S, S, S, W, B, S }, false },
+    [P_SLIDE] = { spv_slide, sizeof(spv_slide), 6, { S, S, S, S, W, B }, false },
+    [P_SYNTH] = { spv_synth, sizeof(spv_synth), 7, { S, S, S, W, B, S, S }, false },
 };
 #undef S
 #undef W
@@ -122,4 +125,20 @@ static inline struct synth_pc synth_push(VkExtent2D full, const VkExtent2D *luma
     };
 }
 
-_Static_assert(sizeof(struct motion_pc) <= PUSH_SIZE && sizeof(struct synth_pc) <= PUSH_SIZE, "PUSH_SIZE");
+struct slide_pc {
+    float size[2], mv_to_px[2];
+    int32_t frame, keep;
+};
+
+// keep: the previous frame's slide image was written (it holds which blocks found HUD sliding)
+static inline struct slide_pc slide_push(VkExtent2D full, const VkExtent2D *luma, uint32_t frame, bool keep)
+{
+    return (struct slide_pc){
+        { full.width, full.height },
+        { (float)full.width / luma[0].width, (float)full.height / luma[0].height },
+        (int32_t)(frame & 0x7fffffff), keep,
+    };
+}
+
+_Static_assert(sizeof(struct motion_pc) <= PUSH_SIZE && sizeof(struct synth_pc) <= PUSH_SIZE &&
+                   sizeof(struct slide_pc) <= PUSH_SIZE, "PUSH_SIZE");

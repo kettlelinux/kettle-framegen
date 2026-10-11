@@ -1,0 +1,140 @@
+// SPDX-License-Identifier: BSD-3-Clause
+// HUD content that slides sideways over the moving scene, for synth.comp: a compass's letters
+// and markers as the camera turns (Skyrim). The compass is translucent, so nothing in it is
+// still, and its letters move neither with the scene nor not at all: no block vector has their
+// motion (the blocks are the scene's, and one that found it would be a lone vector the filter
+// drops). Matching a single pixel can't find it either: dark bar matches dark bar at any shift.
+// So per block, a strip a few blocks wide is matched at each sideways shift, which only lines up
+// at the letters' own motion. Where it fits clearly better than the block's vector, it is
+// stored for synth.comp to try (.xy, .z = 1).
+// Searching every block costs far too much (45 ms per frame on the Adreno 740, with a full
+// search), and a HUD stays where it is on the screen: .w keeps how lately each block found one,
+// and only blocks next to one found lately search every frame. Elsewhere a block looks one frame
+// in DISCOVER, in turn, and a find makes it and its neighbours search on (the letters move along
+// the bar, and it spans two or three rows of blocks). The search itself is coarse first (every
+// fourth shift, unfiltered samples), then on the whole strip around the best.
+#version 450
+layout(local_size_x = 8, local_size_y = 8) in;
+
+layout(binding = 0) uniform sampler2D prev_img;
+layout(binding = 1) uniform sampler2D cur_img;
+layout(binding = 2) uniform sampler2D mv;
+layout(binding = 3) uniform sampler2D before;  // the previous frame's (for .w)
+layout(binding = 4, rgba16f) uniform writeonly image2D dst;
+layout(binding = 5) readonly buffer Cut {  // filter.comp's
+    uint bad_blocks;
+    ivec2 sum;  // vectors, level-0 pixels in 1/16ths
+} cut;
+
+layout(push_constant) uniform PC {
+    vec2 size;      // frame, pixels
+    vec2 mv_to_px;  // level-0 pixels to frame pixels
+    int frame;      // counts frames, for the blocks that look in turn
+    int keep;       // `before` holds the previous frame's (else nothing was found yet)
+} pc;
+
+const int BLOCK = 8;         // motion.comp B
+const int TAPS = 17;         // across the strip...
+const int ROWS = 3;          // ...in rows
+const float WIDTH = 3.0;     // the strip, blocks
+const float REACH = 2.25;    // the farthest shift either way, blocks
+const float POOR = 0.06;     // the field's mean difference over the strip from which to search
+const float BETTER = 0.7;    // a shift has to fit this much better than the field's...
+const float APART = 4.0;     // ...and be this far from it and from still, pixels...
+const float CAMERA = 8.0;    // ...and this far from the frame's mean motion (the camera's)...
+const float WITH = 12.0;     // ...over a block that moves within this of it
+const int DISCOVER = 64;     // 1 block in this many looks each frame
+const float LATELY = 0.995;  // .w per frame without a find (about 6 s at 30 fps to NEAR)
+const float NEAR = 0.4;      // .w around from which a block searches every frame
+
+float diff(vec4 x, vec4 y)
+{
+    vec3 d = abs(x.rgb - y.rgb);
+    return d.r + d.g + d.b;
+}
+
+// Mean difference over the strip around c (frame pixels) along bilateral vector v
+float strip(vec2 c, vec2 v, vec2 step, vec2 rcp)
+{
+    float e = 0.0;
+    for (int k = 0; k < TAPS * ROWS; k++) {
+        vec2 o = vec2(float(k % TAPS - TAPS / 2) * step.x, float(k / TAPS - ROWS / 2) * step.y);
+        e += diff(textureLod(prev_img, (c + o - 0.5 * v) * rcp, 0.0), textureLod(cur_img, (c + o + 0.5 * v) * rcp, 0.0));
+    }
+    return e / float(TAPS * ROWS);
+}
+
+// The same, coarser and unfiltered, for even shifts
+float quick(ivec2 c, int x, int step, int row)
+{
+    ivec2 last = ivec2(pc.size) - 1;
+    float e = 0.0;
+    for (int k = 0; k < 27; k++) {
+        ivec2 o = ivec2((k % 9 - 4) * step, (k / 9 - 1) * row);
+        e += diff(texelFetch(prev_img, clamp(c + o - ivec2(x / 2, 0), ivec2(0), last), 0),
+                  texelFetch(cur_img, clamp(c + o + ivec2(x / 2, 0), ivec2(0), last), 0));
+    }
+    return e / 27.0;
+}
+
+void main()
+{
+    ivec2 b = ivec2(gl_GlobalInvocationID.xy);
+    ivec2 grid = imageSize(dst);
+    if (any(greaterThanEqual(b, grid)))
+        return;
+    float lately = 0.0, around = 0.0;
+    if (pc.keep != 0) {
+        lately = texelFetch(before, b, 0).w;
+        for (int k = 0; k < 9; k++)
+            around = max(around, texelFetch(before, clamp(b + ivec2(k % 3 - 1, k / 3 - 1), ivec2(0), grid - 1), 0).w);
+    }
+    bool look = ((b.x * 7 + b.y * 13 + pc.frame) % DISCOVER) == 0;
+    vec4 none = vec4(0.0, 0.0, 0.0, LATELY * lately);
+    vec2 mean = vec2(cut.sum) / (16.0 * float(grid.x * grid.y)) * pc.mv_to_px;
+    vec2 field = texelFetch(mv, b, 0).xy * pc.mv_to_px;
+    if ((around < NEAR && !look) || distance(field, mean) > WITH) {
+        imageStore(dst, b, none);
+        return;
+    }
+    vec2 rcp = 1.0 / pc.size;
+    vec2 block = float(BLOCK) * pc.mv_to_px;  // a block, frame pixels
+    vec2 c = (vec2(b) + 0.5) * block;
+    vec2 step = vec2(WIDTH * block.x / float(TAPS - 1), block.y / float(ROWS));
+    float at_field = strip(c, field, step, rcp);
+    if (at_field < POOR) {
+        imageStore(dst, b, none);
+        return;
+    }
+    // every fourth shift, coarsely (a little cost for longer ones: the nearest of equals)...
+    int r = int(REACH * block.x) & ~1;
+    int s = max(int(step.x * 2.0), 1);
+    float coarse = 1e9, x = 0.0;
+    for (int k = -r; k <= r; k += 4) {
+        float e = quick(ivec2(c), k, s, max(int(step.y), 1)) + 0.0005 * abs(float(k));
+        if (e < coarse) {
+            coarse = e;
+            x = float(k);
+        }
+    }
+    // ...then 2 and 1 either side on the whole strip
+    float best = strip(c, vec2(x, 0.0), step, rcp) + 0.0005 * abs(x);
+    for (int d = 2; d >= 1; d--) {
+        float x0 = x;
+        for (int k = -d; k <= d; k += 2 * d) {
+            float e = strip(c, vec2(x0 + float(k), 0.0), step, rcp) + 0.0005 * abs(x0 + float(k));
+            if (e < best) {
+                best = e;
+                x = x0 + float(k);
+            }
+        }
+    }
+    vec2 v = vec2(x, 0.0);
+    // HUD content moves unlike the camera, over a block that moves with it (the scene behind
+    // shows through, and around the letters): scenery the blocks lost moves with the camera,
+    // and a figure (a sword) has a block vector of its own, with its edges handled in synth.comp.
+    // Still HUD is synth.comp's too.
+    bool found = best < BETTER * at_field && distance(v, field) > APART && abs(v.x) > APART &&
+                 distance(v, mean) > CAMERA;
+    imageStore(dst, b, found ? vec4(v, 1.0, 1.0) : none);
+}

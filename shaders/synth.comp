@@ -56,6 +56,7 @@ layout(binding = 4) readonly buffer Cut {
     ivec2 sum;  // vectors, level-0 pixels in 1/16ths
 } cut;
 layout(binding = 5) uniform sampler2D hud;  // still.comp: 1 where the frames are the same
+layout(binding = 6) uniform sampler2D slide;  // slide.comp: HUD content sliding sideways, per block
 
 const float LOST_FROM = 0.02, LOST_TO = 0.04;  // block match cost: motion followed .. lost
 const float UNMATCHED = 0.06;  // block match cost from which its vectors are no use at all
@@ -64,6 +65,7 @@ const int NC = 7;              // candidate vectors: here, the 4 nearest blocks,
 const mediump float POOR = 0.5;  // the best match cost from which those further off are tried
 const mediump float ZERO_MOVING = 0.5;  // the zero vector's extra cost where this pixel changed
 const mediump float HUD_LATELY = 0.75;  // still.comp's .g from which a pixel counts as the HUD
+const mediump float SLIDE_GAIN = 0.15;  // slide.comp's vector is taken where it matches within this of the best
 
 layout(push_constant) uniform PC {
     vec2 size;      // frame, pixels
@@ -101,6 +103,7 @@ vec2 mean;                   // the frame's mean motion: the camera's
 mediump float figure = 1e4;  // the best match of a vector away from it: a figure's
 float scale;                 // how much of the frame is lost (see main): 1 none .. 0 all
 mediump float lost = 0.0;    // how lost the motion is here
+bool slid = false;           // follows HUD content sliding sideways (slide.comp)
 // every candidate's blend weighed by 1 / (cost^2 + SOFT_E), summed as they come
 mediump vec4 soft_sum = vec4(0.0);
 mediump float soft_w = 0.0;
@@ -313,11 +316,42 @@ void main()
                 cost_b = c;
             }
         }
+        // HUD content sliding sideways over the scene (a compass's letters as the camera turns):
+        // where slide.comp found it in the blocks around, its vector, taken where it fits nearly
+        // as well as the best (dark bar matches dark bar along the scene's vector too, which
+        // would leave the letters out). Such a pixel is done: the paths below, for the scene
+        // and the still HUD, would drag the letters back along with it.
+        mediump float slide_best = 1e4;
+        // one filtered read tells whether any of the four found something (most pixels: none)
+        bool any_slide = textureLod(slide, q * pc.mv_uv, 0.0).z > 0.0;
+        for (int k = 0; k < 4 && any_slide; k++) {
+            vec4 m = texelFetch(slide, clamp(i + ivec2(k & 1, k >> 1), ivec2(0), last), 0);
+            if (m.z < 0.5)
+                continue;
+            vec2 v = m.xy;
+            vec2 qa = q - pc.t * v, qb = q + (1.0 - pc.t) * v;
+            // still HUD doesn't slide (text over a scene the search can't follow)
+            if (!inside(qa) || !inside(qb) || textureLod(hud, qa * rcp, 0.0).r > 0.5 ||
+                textureLod(hud, qb * rcp, 0.0).r > 0.5)
+                continue;
+            mediump vec4 pa = textureLod(prev_img, qa * rcp, 0.0), pb = textureLod(cur_img, qb * rcp, 0.0);
+            mediump float c = diff(pa, pb) +
+                2.0 * min(diff(textureLod(prev_img, (qa - dx) * rcp, 0.0), textureLod(cur_img, (qb - dx) * rcp, 0.0)),
+                          diff(textureLod(prev_img, (qa + dx) * rcp, 0.0), textureLod(cur_img, (qb + dx) * rcp, 0.0)));
+            if (c < best + SLIDE_GAIN && c < slide_best) {
+                slide_best = c;
+                a = pa;
+                b = pb;
+                slid = true;
+            }
+        }
+        if (slid)
+            best = min(best, slide_best);
     } else {
         try_vector(q, vec2(0.0), 0.0);
     }
     mediump vec3 d = abs(a.rgb - b.rgb);
-    mediump float w = flow ? smoothstep(0.08, 0.25, max(d.r, max(d.g, d.b))) : 0.0;
+    mediump float w = flow && !slid ? smoothstep(0.08, 0.25, max(d.r, max(d.g, d.b))) : 0.0;
     mediump vec4 alone = pc.t < 0.5 ? a : b;
     if (flow) {
         // figure: the candidate farthest from the background's (kb, above)
@@ -329,7 +363,7 @@ void main()
         // figure is found there, what any vector matched instead was chance (specks beside
         // thin figures): the frame showing the background is used
         mediump float occ = smoothstep(0.5, 0.7, cost_b) * smoothstep(0.2, 0.4, figure);
-        if ((w > 0.0 || occ > 0.0) && distance(vf, vb) > 1.0) {
+        if ((w > 0.0 || occ > 0.0) && distance(vf, vb) > 1.0 && !slid) {
             // the colour test says whether it is hidden; the figure's side, where it can,
             // which frame shows it
             bool told;
@@ -341,7 +375,7 @@ void main()
         }
     }
     mediump vec4 base = mix(a, b, pc.t);
-    if (flow && soft_w > 0.0) {
+    if (flow && soft_w > 0.0 && !slid) {
         // Where no vector fits (beside a figure, the strip whose background one frame doesn't
         // show; fine texture in a fast turn), each pixel's own pick flips between candidates
         // from pixel to pixel (sparkle around a sword at 30 fps): the candidates' blends weighed
@@ -350,7 +384,7 @@ void main()
         base = mix(base, soft_sum / soft_w, soften);
     }
     mediump vec4 c = mix(base, alone, w);
-    if (flow && lost > 0.0) {
+    if (flow && lost > 0.0 && !slid) {
         // Lost motion falls back on the nearer frame alone. Where the blocks still matched
         // fairly, their vectors are right and only the content changed between the frames (a
         // sword's highlights as it turns): the nearer frame along them, so things still move.
@@ -399,7 +433,7 @@ void main()
         // (distant hills in haze) also changes little under, but follows. A tie keeps it: in
         // flat HUD colour any vector fits, and near its edge the one taken carried the HUD off.
         mediump float stays = smoothstep(HUD_LATELY - 0.1, HUD_LATELY + 0.1, texelFetch(hud, p, 0).g);
-        if (stays > 0.0) {
+        if (stays > 0.0 && !slid) {
             mediump float still_cost = diff(sa, sb);
             vec2 v0 = cand[0];
             mediump float scene_cost = diff(textureLod(prev_img, (q - pc.t * v0) * rcp, 0.0),
