@@ -453,10 +453,11 @@ struct swapchain {
     struct rec *rec;       // rec_start(): every frame shown, being recorded
     double probe_at;
     // Created on the first present (they need the present queue's family): the frame ring,
-    // kept for the swapchain's life since presents wait on its semaphores, and the flow
-    // resources, rebuilt when flow_scale changes. broken: creating them failed, frames pass
-    // through untouched.
+    // and the flow resources, rebuilt when flow_scale changes. broken: creating them failed,
+    // frames pass through untouched until another try at retry_at (memory may come free); the
+    // wait doubles with each failure, up to 5 minutes.
     bool ring_built, flow_built, broken;
+    double retry_at, retry_wait;
     uint32_t family;
     float flow_scale;
     VkCommandPool pool;
@@ -2000,7 +2001,7 @@ static void present_image(struct swapchain *sc, VkQueue queue, uint32_t image, V
 static VkResult present_frames(VkQueue queue, const VkPresentInfoKHR *pi, struct swapchain *sc)
 {
     struct dev *d = find_dev(KEY(queue));
-    if (!sc || sc->broken)
+    if (!sc || (sc->broken && now_s() < sc->retry_at))
         return d->QueuePresentKHR(queue, pi);
     VkDevice dev = d->handle;
     struct config c = config_get();
@@ -2024,10 +2025,18 @@ static VkResult present_frames(VkQueue queue, const VkPresentInfoKHR *pi, struct
         flow_free(sc);
     ok = ok && (sc->flow_built || flow_build(sc, c.flow_scale));
     if (!ok) {
-        say("couldn't create its resources, frame generation off for this swapchain");
+        sc->retry_wait = sc->retry_wait ? fmin(2.0 * sc->retry_wait, 300.0) : 10.0;
+        say("couldn't create its resources, frame generation off for this swapchain (trying again in %.0f s)",
+            sc->retry_wait);
         sc_free(sc);
         sc->broken = true;
+        sc->retry_at = now_s() + sc->retry_wait;
         return present_game(sc, queue, pi, c.low_latency);
+    }
+    if (sc->broken) {
+        say("created its resources now, frame generation back on");
+        sc->broken = false;
+        sc->retry_wait = 0.0;
     }
 
     int slot = sc->count % RING;
