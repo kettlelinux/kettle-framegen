@@ -74,8 +74,10 @@ struct pic {
     uint8_t *rgb;
 };
 
+// Replaces p->rgb, which the caller has freed; NULL again where reading fails
 static bool ppm_read(const char *path, struct pic *p)
 {
+    p->rgb = NULL;
     FILE *f = fopen(path, "rb");
     if (!f)
         return false;
