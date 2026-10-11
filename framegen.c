@@ -147,8 +147,14 @@ static void config_load(void)
     struct config c = { .multiplier = 2, .flow_scale = 0.5f, .flow = true, .fifo = true };
     FILE *f = fopen(cfg_path, "r");
     if (f) {
-        char line[256];
+        char line[1024];  // a dump path takes up to 511
         while (fgets(line, sizeof(line), f)) {
+            if (!strchr(line, '\n') && !feof(f)) {  // longer still: dropped whole, not read in pieces
+                int ch;
+                while ((ch = fgetc(f)) != '\n' && ch != EOF)
+                    ;
+                continue;
+            }
             // `#` starts a comment at the start of a line or after whitespace (a dump path
             // may contain one)
             for (char *h = line; (h = strchr(h, '#')); h++)
@@ -180,11 +186,13 @@ static void config_load(void)
         c.flow_scale = 0.1f;
     if (c.flow_scale > 1.0f)
         c.flow_scale = 1.0f;
-    if (!(c.refresh > 0.0f))  // NaN too
+    if (!(c.refresh > 0.0f) || isinf(c.refresh))  // NaN too
         c.refresh = 0.0f;
     if (!(c.record > 0.0f))
         c.record = 0.0f;
-    if (!(c.min_fps > 0.0f))
+    if (c.record > 600.0f)  // inf too; a frame count the size of a uint32_t is far beyond the heap
+        c.record = 600.0f;
+    if (!(c.min_fps > 0.0f) || isinf(c.min_fps))
         c.min_fps = 0.0f;
     if (c.dump[0])
         cfg_dump_serial++;
