@@ -44,6 +44,9 @@
 // GPU timestamps per present: start, then the end of each stage
 enum { TS_START, TS_PYRAMID, TS_MOTION, TS_SYNTH, TS_OUTPUT, NTS };
 #define ACQUIRE_TIMEOUT 100000000ull  // ns
+#define PROBE_TIMEOUT 50000000ull     // ns: a few refreshes, as long as FIFO takes to free an image
+#define PROBE_WAIT 2.0                // s: after a timeout, the first try for one more spare image...
+#define PROBE_WAIT_MAX 60.0           // ...doubling while it finds none, up to this
 #define LATENCY_TIMEOUT 100000000ull  // ns: "latency = low" waits no longer for a frame to be shown
 #define PACE_TRY 10.0       // s: multiplier = auto tries one less this long after a change, and
                             // doesn't raise past a raise that showed no more frames for this long...
@@ -439,7 +442,7 @@ struct swapchain {
     // is only free again once its image has been acquired again.
     VkSemaphore *present_sems;
     // Generated frames per present that found a spare image; after a timeout, one more is
-    // tried (without waiting) every 10 s from probe_at
+    // tried at probe_at, probe_wait after the last try (see present_frames())
     uint32_t gen_limit;
     unsigned dump_serial;  // last config dump request served
     struct {               // burst(): a run of real frames being captured
@@ -452,7 +455,7 @@ struct swapchain {
         VkFence fence[MAX_BURST];
     } burst;
     struct rec *rec;       // rec_start(): every frame shown, being recorded
-    double probe_at;
+    double probe_at, probe_wait;
     // Created on the first present (they need the present queue's family): the frame ring,
     // and the flow resources, rebuilt when flow_scale changes. broken: creating them failed,
     // frames pass through untouched until another try at retry_at (memory may come free); the
@@ -2204,28 +2207,38 @@ static VkResult present_frames(VkQueue queue, const VkPresentInfoKHR *pi, struct
     d->ResetFences(dev, 1, &f->fence);
 
     // Spare images for the generated frames. Waiting here is FIFO pacing at work; a timeout
-    // means the images ran out (preserve_images) or presentation stalled (hidden window).
+    // means the images ran out (preserve_images) or presentation stalled (hidden window, as
+    // while Steam's menu is open in gamescope). The try for one more waits for an image too:
+    // with the display full, FIFO frees none until the next refresh, so a try that doesn't wait
+    // never finds one. A failed try stalls the game for PROBE_TIMEOUT, so the wait before the
+    // next one doubles, and a swapchain that is really short of images stalls only now and then.
     uint32_t idx = pi->pImageIndices[0], acq[MAX_GEN], ngen = 0;
     while (sc->have_prev && ngen < (uint32_t)mult - 1) {
         bool probe = ngen >= sc->gen_limit;
         if (probe && now_s() < sc->probe_at)
             break;
         double t = now_s();
-        VkResult r = d->AcquireNextImageKHR(dev, sc->handle, probe ? 0 : ACQUIRE_TIMEOUT, f->acquired[ngen],
+        VkResult r = d->AcquireNextImageKHR(dev, sc->handle, probe ? PROBE_TIMEOUT : ACQUIRE_TIMEOUT, f->acquired[ngen],
                                             VK_NULL_HANDLE, &acq[ngen]);
         waited(sc, t);
         if (r == VK_TIMEOUT || r == VK_NOT_READY) {
             if (!probe) {
-                say("no spare swapchain image after %u generated frames, generating at most that many", ngen);
                 sc->gen_limit = ngen;
+                sc->probe_wait = PROBE_WAIT;
+            } else {
+                sc->probe_wait = fmin(2.0 * sc->probe_wait, PROBE_WAIT_MAX);
             }
-            sc->probe_at = now_s() + 10.0;
+            say("no spare swapchain image after %u generated frames, generating at most that many, "
+                "trying again in %.0f s", ngen, sc->probe_wait);
+            sc->probe_at = now_s() + sc->probe_wait;
             break;
         }
         if (r != VK_SUCCESS && r != VK_SUBOPTIMAL_KHR)
             break;
-        if (probe)
+        if (probe) {
+            say("found a spare swapchain image again, generating up to %u frames", ngen + 1);
             sc->gen_limit = ngen + 1;
+        }
         ngen++;
     }
 
