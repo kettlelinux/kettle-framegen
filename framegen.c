@@ -304,7 +304,7 @@ struct inst {
 #define DEV_FUNCS(X)                                                                           \
     X(DestroyDevice) X(GetDeviceQueue) X(GetDeviceQueue2) X(QueueSubmit)                       \
     X(CreateSwapchainKHR) X(DestroySwapchainKHR) X(GetSwapchainImagesKHR)                      \
-    X(AcquireNextImageKHR) X(QueuePresentKHR)                                                  \
+    X(AcquireNextImageKHR) X(AcquireNextImage2KHR) X(QueuePresentKHR)                          \
     X(CreateImage) X(DestroyImage) X(GetImageMemoryRequirements) X(AllocateMemory)            \
     X(FreeMemory) X(BindImageMemory) X(CreateImageView) X(DestroyImageView)                    \
     X(CreateSampler) X(DestroySampler) X(CreateShaderModule) X(DestroyShaderModule)            \
@@ -2373,6 +2373,18 @@ static VKAPI_ATTR VkResult VKAPI_CALL AcquireNextImageKHR(VkDevice device, VkSwa
     return r;
 }
 
+static VKAPI_ATTR VkResult VKAPI_CALL AcquireNextImage2KHR(VkDevice device, const VkAcquireNextImageInfoKHR *ai,
+                                                           uint32_t *index)
+{
+    struct dev *d = find_dev(KEY(device));
+    struct swapchain *sc = find_sc(d, ai->swapchain, false);
+    double t = now_s();
+    VkResult r = d->AcquireNextImage2KHR(device, ai, index);
+    if (sc)
+        waited(sc, t);
+    return r;
+}
+
 // ---------- instance, device, queues ----------
 
 static VKAPI_ATTR VkResult VKAPI_CALL CreateInstance(const VkInstanceCreateInfo *ci,
@@ -2762,6 +2774,7 @@ static PFN_vkVoidFunction intercept(const char *name)
         { "vkCreateSwapchainKHR", (PFN_vkVoidFunction)CreateSwapchainKHR },
         { "vkDestroySwapchainKHR", (PFN_vkVoidFunction)DestroySwapchainKHR },
         { "vkAcquireNextImageKHR", (PFN_vkVoidFunction)AcquireNextImageKHR },
+        { "vkAcquireNextImage2KHR", (PFN_vkVoidFunction)AcquireNextImage2KHR },
         { "vkQueuePresentKHR", (PFN_vkVoidFunction)QueuePresentKHR },
     };
     for (size_t i = 0; i < sizeof(funcs) / sizeof(*funcs); i++)
