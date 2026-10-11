@@ -253,6 +253,17 @@ def main():
         if conf:
             with open(os.path.join(d, "case.conf"), "w") as f:
                 f.write("".join(line + "\n" for line in conf))
+        elif os.path.exists(os.path.join(d, "case.conf")):
+            os.remove(os.path.join(d, "case.conf"))
+        # frames and truths left from an earlier version of the case (more frames, another
+        # multiplier); its references go with the next make test-update
+        keep = {"%d.ppm" % i for i in range(frames)}
+        keep |= {os.path.join("truth", "%d-%d.ppm" % (i, k)) for i in range(1, frames) for k in range(1, m)}
+        for sub in ("", "truth"):
+            if os.path.isdir(os.path.join(d, sub)):
+                for f in os.listdir(os.path.join(d, sub)):
+                    if f.endswith(".ppm") and os.path.join(sub, f) not in keep:
+                        os.remove(os.path.join(d, sub, f))
         for i in range(frames):
             write(os.path.join(d, "%d.ppm" % i), render(scene, i))
             if i:
