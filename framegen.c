@@ -349,6 +349,7 @@ struct dev {
     VkPipeline pipe[NPIPE];
     // VK_KHR_present_wait (and the present_id it needs), for "latency = low" and its stats
     PFN_vkWaitForPresentKHR WaitForPresentKHR;
+    bool game_ids;  // the game enabled present ids itself: its own then, never mixed with the layer's
 #ifdef VK_EXT_present_timing
     PFN_vkGetSwapchainTimingPropertiesEXT GetSwapchainTimingPropertiesEXT;  // the refresh rate
 #endif
@@ -1891,12 +1892,12 @@ static VkResult present_game(struct swapchain *sc, VkQueue queue, const VkPresen
     VkPresentIdKHR mine;
     if (id > sc->present_id) {
         sc->present_id = id;
-    } else if (!gid) {
+    } else if (!gid && !d->game_ids) {  // ids must rise: one of the layer's could match the game's next
         id = ++sc->present_id;
         mine = (VkPresentIdKHR){ VK_STRUCTURE_TYPE_PRESENT_ID_KHR, pi->pNext, 1, &id };
         tagged.pNext = &mine;
     } else {
-        id = 0;  // the game's struct without an id for this frame (or out of order): not followed
+        id = 0;  // no id from the game for this frame (or out of order): not followed
     }
     VkResult r = present(sc, queue, &tagged);
     if (id && sc->prev_id) {
@@ -1911,7 +1912,7 @@ static VkResult present_game(struct swapchain *sc, VkQueue queue, const VkPresen
             }
         }
     }
-    if (id)
+    if (id && r >= 0)  // a present that failed queued no id to wait for
         sc->prev_id = id;
     return r;
 }
@@ -2644,6 +2645,10 @@ static VKAPI_ATTR VkResult VKAPI_CALL CreateDevice(VkPhysicalDevice phys, const 
     d->inst = i;
     d->gdpa = gdpa;
     d->set_loader_data = cb->u.pfnSetDeviceLoaderData;
+    d->game_ids = names_ext(ci->ppEnabledExtensionNames, ci->enabledExtensionCount, VK_KHR_PRESENT_ID_EXTENSION_NAME);
+#ifdef VK_KHR_present_id2
+    d->game_ids |= names_ext(ci->ppEnabledExtensionNames, ci->enabledExtensionCount, VK_KHR_PRESENT_ID_2_EXTENSION_NAME);
+#endif
 #define X(n) d->n = (PFN_vk##n)gdpa(*out, "vk" #n);
     DEV_FUNCS(X)
 #undef X
