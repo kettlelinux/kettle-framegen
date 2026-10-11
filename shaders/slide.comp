@@ -43,7 +43,7 @@ const float BETTER = 0.7;    // a shift has to fit this much better than the fie
 const float APART = 4.0;     // ...and be this far from it and from still, pixels...
 const float CAMERA = 8.0;    // ...and this far from the frame's mean motion (the camera's)...
 const float WITH = 12.0;     // ...over a block that moves within this of it
-const int DISCOVER = 64;     // 1 block in this many looks each frame
+const int DISCOVER = 128;    // 1 block in this many looks each frame
 const float LATELY = 0.995;  // .w per frame without a find (about 6 s at 30 fps to NEAR)
 const float NEAR = 0.4;      // .w around from which a block searches every frame
 
@@ -64,17 +64,20 @@ float strip(vec2 c, vec2 v, vec2 step, vec2 rcp)
     return e / float(TAPS * ROWS);
 }
 
-// The same, coarser and unfiltered, for even shifts
-float quick(ivec2 c, int x, int step, int row)
+// The same, coarser, for even shifts. Each sample is 4 pixels across (two filtered reads between
+// texels): sharp letters match within a pixel of their motion and hardly at all a pixel off, so
+// every fourth shift would miss it unsmoothed.
+float quick(vec2 c, int x, float step, float row, vec2 rcp)
 {
-    ivec2 last = ivec2(pc.size) - 1;
     float e = 0.0;
-    for (int k = 0; k < 27; k++) {
-        ivec2 o = ivec2((k % 9 - 4) * step, (k / 9 - 1) * row);
-        e += diff(texelFetch(prev_img, clamp(c + o - ivec2(x / 2, 0), ivec2(0), last), 0),
-                  texelFetch(cur_img, clamp(c + o + ivec2(x / 2, 0), ivec2(0), last), 0));
+    for (int k = 0; k < 18; k++) {
+        vec2 o = vec2(float(k % 9 - 4) * step, (float(k / 9) - 0.5) * row);
+        vec2 qa = c + o - vec2(float(x / 2), 0.0), qb = c + o + vec2(float(x / 2), 0.0);
+        vec2 h = vec2(1.0, 0.0);
+        e += diff(textureLod(prev_img, (qa - h) * rcp, 0.0) + textureLod(prev_img, (qa + h) * rcp, 0.0),
+                  textureLod(cur_img, (qb - h) * rcp, 0.0) + textureLod(cur_img, (qb + h) * rcp, 0.0));
     }
-    return e / 27.0;
+    return e / 36.0;
 }
 
 void main()
@@ -93,7 +96,11 @@ void main()
     vec4 none = vec4(0.0, 0.0, 0.0, LATELY * lately);
     vec2 mean = vec2(cut.sum) / (16.0 * float(grid.x * grid.y)) * pc.mv_to_px;
     vec2 field = texelFetch(mv, b, 0).xy * pc.mv_to_px;
-    if ((around < NEAR && !look) || distance(field, mean) > WITH) {
+    // Where HUD slid lately, the blocks search whatever their own vector (in a fast turn the
+    // motion search loses the compass's rows, and the vectors there are anything); elsewhere
+    // only blocks that move with the camera (a sword has a vector of its own)
+    bool known = around >= NEAR;
+    if ((!known && !look) || (!known && distance(field, mean) > WITH)) {
         imageStore(dst, b, none);
         return;
     }
@@ -102,7 +109,7 @@ void main()
     vec2 c = (vec2(b) + 0.5) * block;
     vec2 step = vec2(WIDTH * block.x / float(TAPS - 1), block.y / float(ROWS));
     float at_field = strip(c, field, step, rcp);
-    if (at_field < POOR) {
+    if (at_field < POOR && !known) {
         imageStore(dst, b, none);
         return;
     }
@@ -111,7 +118,7 @@ void main()
     int s = max(int(step.x * 2.0), 1);
     float coarse = 1e9, x = 0.0;
     for (int k = -r; k <= r; k += 4) {
-        float e = quick(ivec2(c), k, s, max(int(step.y), 1)) + 0.0005 * abs(float(k));
+        float e = quick(floor(c), k, float(s), max(floor(step.y), 1.0), rcp) + 0.0005 * abs(float(k));
         if (e < coarse) {
             coarse = e;
             x = float(k);
