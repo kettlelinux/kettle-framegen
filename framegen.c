@@ -1030,7 +1030,7 @@ static void rec_copy(struct swapchain *sc, VkCommandBuffer cmd, int slot, uint32
 // Record one present's work: history copy and pyramid always (the next frame needs them),
 // motion and ngen generated frames into the acquired images acq[] when there are any.
 static void record(struct swapchain *sc, VkCommandBuffer cmd, int slot, uint32_t idx,
-                   const uint32_t *acq, uint32_t ngen, int multiplier, bool flow)
+                   const uint32_t *acq, uint32_t ngen, bool flow)
 {
     struct dev *d = sc->dev;
     int c = sc->cur;
@@ -1120,9 +1120,9 @@ static void record(struct swapchain *sc, VkCommandBuffer cmd, int slot, uint32_t
         }
         STAMP(TS_MOTION);
 
-        // 4. the in-between frames
+        // 4. the in-between frames, evenly spaced however many spare images there were
         for (uint32_t k = 0; k < ngen; k++) {
-            struct synth_pc pc = synth_push(full, sc->luma, sc->mv, (k + 1.0f) / multiplier, flow,
+            struct synth_pc pc = synth_push(full, sc->luma, sc->mv, (k + 1.0f) / (ngen + 1), flow,
                                             sc->hist_format == VK_FORMAT_A2B10G10R10_UNORM_PACK32);
             run(d, cmd, P_SYNTH, sc->ds_synth[c][k], &pc, sizeof(pc), full);
         }
@@ -2065,7 +2065,7 @@ static VkResult present_frames(VkQueue queue, const VkPresentInfoKHR *pi, struct
     }
     uint32_t rec_at = sc->rec ? sc->rec->used : 0;  // its first frame this present, if it records any
     bool fresh = sc->fresh;
-    record(sc, f->cmd, slot, idx, acq, ngen, mult, c.flow);
+    record(sc, f->cmd, slot, idx, acq, ngen, c.flow);
     bool rec = sc->rec && sc->rec->used > rec_at;
 
     // The game's wait semaphores gate our copy of its frame; its present then waits for us.
