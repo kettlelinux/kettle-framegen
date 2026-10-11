@@ -2344,6 +2344,8 @@ static VKAPI_ATTR VkResult VKAPI_CALL CreateInstance(const VkInstanceCreateInfo 
         return VK_ERROR_INITIALIZATION_FAILED;
     PFN_vkGetInstanceProcAddr gipa = link->u.pLayerInfo->pfnNextGetInstanceProcAddr;
     link->u.pLayerInfo = link->u.pLayerInfo->pNext;
+    // Each layer below moves the same link on, so a second try down the chain starts it here again
+    VkLayerInstanceLink *below = link->u.pLayerInfo;
 
     PFN_vkCreateInstance create = (PFN_vkCreateInstance)gipa(NULL, "vkCreateInstance");
     // VK_EXT_present_timing (the display's refresh rate, for multiplier = auto) needs
@@ -2364,8 +2366,10 @@ static VKAPI_ATTR VkResult VKAPI_CALL CreateInstance(const VkInstanceCreateInfo 
         free(names);
         caps2 = r == VK_SUCCESS;
     }
-    if (!caps2 || !names)
+    if (!caps2 || !names) {
+        link->u.pLayerInfo = below;
         r = create(ci, alloc, out);
+    }
     if (r != VK_SUCCESS)
         return r;
 
@@ -2563,6 +2567,7 @@ static VKAPI_ATTR VkResult VKAPI_CALL CreateDevice(VkPhysicalDevice phys, const 
     PFN_vkGetInstanceProcAddr gipa = link->u.pLayerInfo->pfnNextGetInstanceProcAddr;
     PFN_vkGetDeviceProcAddr gdpa = link->u.pLayerInfo->pfnNextGetDeviceProcAddr;
     link->u.pLayerInfo = link->u.pLayerInfo->pNext;
+    VkLayerDeviceLink *below = link->u.pLayerInfo;  // as in CreateInstance
 
     PFN_vkCreateDevice create = (PFN_vkCreateDevice)gipa(i->handle, "vkCreateDevice");
     VkDeviceCreateInfo ci2;
@@ -2575,8 +2580,10 @@ static VKAPI_ATTR VkResult VKAPI_CALL CreateDevice(VkPhysicalDevice phys, const 
     free(names);
     bool present_wait = names && r == VK_SUCCESS;
     timing = timing && present_wait;
-    if (!present_wait)  // without them (or as the game asked, when adding them failed)
+    if (!present_wait) {  // without them (or as the game asked, when adding them failed)
+        link->u.pLayerInfo = below;
         r = create(phys, ci, alloc, out);
+    }
     if (r != VK_SUCCESS)
         return r;
 
