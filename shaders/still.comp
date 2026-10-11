@@ -9,9 +9,21 @@
 layout(local_size_x = 16, local_size_y = 8) in;
 layout(local_size_x_id = 0, local_size_y_id = 1) in;  // shaders.h: pipe_group()
 
+//
+// .g: how much of the time lately the pixel stayed nearly the same, a decayed share over the
+// last dozen or so frames. That is the HUD too where the scene shows through it (a translucent
+// bar, a glyph's shadow, a thin ring around a portrait: Deep Rock Galactic), which .r misses as
+// it changes a little with the scene behind. Moving ground stays that close only now and then.
 layout(binding = 0) uniform sampler2D prev_img;
 layout(binding = 1) uniform sampler2D cur_img;
-layout(binding = 2, rgba8) uniform writeonly image2D dst;
+layout(binding = 2, rgba8) uniform image2D dst;
+
+layout(push_constant) uniform PC {
+    int keep;  // dst holds the previous frame's mask (else .g starts from nothing)
+} pc;
+
+const float NEAR = 0.25;   // the change, summed over r, g, b, that still counts as nearly the same
+const float RATE = 0.125;  // weight of this frame in .g
 
 float diff(vec4 x, vec4 y)
 {
@@ -26,5 +38,6 @@ void main()
     if (any(greaterThanEqual(p, size)))
         return;
     float moved = diff(texelFetch(prev_img, p, 0), texelFetch(cur_img, p, 0));
-    imageStore(dst, p, vec4(moved < 0.02 ? 1.0 : 0.0));
+    float lately = mix(pc.keep != 0 ? imageLoad(dst, p).g : 0.0, moved < NEAR ? 1.0 : 0.0, RATE);
+    imageStore(dst, p, vec4(moved < 0.02 ? 1.0 : 0.0, lately, 0.0, 0.0));
 }

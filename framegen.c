@@ -474,6 +474,7 @@ struct swapchain {
     VkDescriptorSet ds_synth[2][MAX_GEN];
     int cur;             // history slot the next presented frame goes to
     bool have_prev;      // the other slot holds the previous frame and its pyramid
+    bool still_kept;     // still holds a mask from before (still.comp keeps a history in it)
     bool have_mv;        // mvf of the other slot holds the previous frame's vectors
     bool fresh;          // images still in UNDEFINED layout
     double gpu_ms[NTS], stat_t;  // per stage (gpu_ms[0]: total), summed over gpu_n presents
@@ -995,6 +996,7 @@ static bool flow_build(struct swapchain *sc, float flow_scale)
     sc->cur = 0;
     sc->have_prev = sc->have_mv = false;
     sc->fresh = true;
+    sc->still_kept = false;
     say("%ux%u: motion at %ux%u, %u levels", full.width, full.height, l0.width, l0.height, sc->levels);
     return true;
 }
@@ -1137,7 +1139,9 @@ static void record(struct swapchain *sc, VkCommandBuffer cmd, int slot, uint32_t
                 compute_to_compute(d, cmd);
             }
             run(d, cmd, P_FILTER, sc->ds_filter[c], NULL, 0, sc->mv[0]);
-            run(d, cmd, P_STILL, sc->ds_still[c], NULL, 0, full);
+            int32_t keep = sc->still_kept;
+            run(d, cmd, P_STILL, sc->ds_still[c], &keep, sizeof(keep), full);
+            sc->still_kept = true;
             compute_to_compute(d, cmd);
         }
         STAMP(TS_MOTION);

@@ -270,6 +270,7 @@ struct run {
     uint32_t levels;
     VkExtent2D luma[MAX_LEVELS], mv[MAX_LEVELS];
     struct img hist[2], pyr[2], mvl[MAX_LEVELS], mvf[2], out[MAX_GEN], still;
+    bool still_kept;  // as the layer's: still holds a mask from before
     VkImageView pyr_level[2][MAX_LEVELS];
     struct buf cut, up, down;
     VkDescriptorPool dpool;
@@ -512,6 +513,8 @@ static void frame(struct run *R, const struct pic *pic, int c, bool first, uint3
     VkCommandBufferBeginInfo bi = { .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO,
                                     .flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT };
     CHECK(vkBeginCommandBuffer(cmd, &bi));
+    if (first)
+        R->still_kept = false;
     if (first) {
         // all images live in GENERAL
         VkImageMemoryBarrier b[2 * 3 + MAX_GEN + 1 + MAX_LEVELS];
@@ -568,7 +571,9 @@ static void frame(struct run *R, const struct pic *pic, int c, bool first, uint3
             }
             stamp(R, cmd, ST_MOTION);
             dispatch(cmd, P_FILTER, R->ds_filter[c], NULL, 0, R->mv[0]);
-            dispatch(cmd, P_STILL, R->ds_still[c], NULL, 0, full);
+            int32_t keep = R->still_kept;
+            dispatch(cmd, P_STILL, R->ds_still[c], &keep, sizeof(keep), full);
+            R->still_kept = true;
             compute_to_compute(cmd);
         } else {
             stamp(R, cmd, ST_MOTION);
